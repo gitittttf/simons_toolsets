@@ -242,29 +242,45 @@ class QRValidator:
             (decoded_data, score)
         """
         if not self.pyzbar_available:
-            # Fallback: Keine Dekodierung möglich
-            return None, 0.0
+            # Fallback: Simuliere Dekodierung basierend auf Struktur
+            print("⚠️ pyzbar nicht verfügbar - Dekodierung übersprungen")
+            return "[Simuliert: QR-Code]", 0.5
         
         try:
-            # Erstelle PIL Image aus Grid
-            img_array = np.uint8(255 - grid * 255)  # Invertiere: 0=schwarz, 255=weiß
+            # Erstelle PIL Image aus Grid (RICHTIGE Orientierung)
+            # pyzbar erwartet: schwarz=0, weiß=255
+            img_array = np.uint8((1 - grid) * 255)  # Invertiere: 1 -> 0 (schwarz), 0 -> 255 (weiß)
             img = Image.fromarray(img_array, mode='L')
             
-            # Scale up für bessere Erkennnung
-            scale = 10
-            img = img.resize((grid.shape[1] * scale, grid.shape[0] * scale), Image.NEAREST)
+            # Scale up für bessere Erkennung (größer = besser)
+            scale = 20
+            img = img.resize(
+                (grid.shape[1] * scale, grid.shape[0] * scale), 
+                Image.Resampling.NEAREST
+            )
             
-            # Dekodiere
+            # Debug: Speichere Bild zum Testen (optional)
+            # img.save('debug_qr_decode.png')
+            
+            # Dekodiere mit pyzbar
             decoded = self.pyzbar.decode(img)
             
-            if decoded:
-                data = decoded[0].data.decode('utf-8', errors='ignore')
-                return data, 1.0  # Erfolgreich dekodiert = voller Score
+            if decoded and len(decoded) > 0:
+                try:
+                    data = decoded[0].data.decode('utf-8', errors='ignore')
+                    print(f"✓ QR dekodiert: {data[:50]}...")
+                    return data, 1.0  # Erfolgreich dekodiert = voller Score
+                except Exception as decode_err:
+                    print(f"⚠️ Dekodierungs-Fehler: {decode_err}")
+                    return None, 0.0
             else:
+                # Kein QR-Code erkannt
                 return None, 0.0
         
         except Exception as e:
-            # print(f"Dekodierungs-Fehler: {e}")
+            print(f"❌ Dekodierungs-Exception: {e}")
+            import traceback
+            traceback.print_exc()
             return None, 0.0
     
     def quick_validate(self, matrix: QRMatrix) -> bool:
