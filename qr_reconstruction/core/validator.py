@@ -1,14 +1,21 @@
 """
-QR-Code Validator mit Confidence-Scoring
-Validiert QR-Codes und berechnet Confidence-Score basierend auf verschiedenen Kriterien
+QR-Code Validator mit verbessertem Content-Scoring
+
+Validiert QR-Codes basierend auf:
+- Struktur (Finder-Patterns, Timing-Patterns)
+- Muster-Qualität
+- Modul-Dichte
+- Dekodierbarkeit (pyzbar)
+- Inhalt (URL-Patterns, Wörterbuch-Matches) [NEU]
 """
 
 import numpy as np
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from PIL import Image
-import qrcode
+import os
 from .qr_matrix import QRMatrix, CellState
+from .content_scorer import ContentScorer, ContentScore, get_content_scorer
 
 
 @dataclass
@@ -20,11 +27,21 @@ class ValidationResult:
     matrix: np.ndarray
     error_correction_level: Optional[str] = None
     
-    # Detaillierte Scores
+    # Detaillierte Scores (alle 0-100)
     structure_score: float = 0.0
     pattern_score: float = 0.0
     decode_score: float = 0.0
     density_score: float = 0.0
+    content_score: float = 0.0  # NEU: Content-basierter Score
+    
+    # Content-Score Details
+    is_url: bool = False
+    url_type: Optional[str] = None
+    german_words: int = 0
+    english_words: int = 0
+    
+    # Debug-Info
+    debug_info: str = ""
     
     def __repr__(self):
         return (f"ValidationResult(valid={self.is_valid}, "
@@ -36,59 +53,90 @@ class QRValidator:
     """
     Validiert QR-Codes und berechnet Confidence-Scores
     
-    Scoring-Kriterien:
-    - Strukturelle Integrität (Finder, Timing, Alignment patterns)
-    - Dekodierbarkeit (kann ein QR-Reader es lesen?)
-    - Dichte-Verteilung (typisch 40-60% schwarze Module)
-    - Pattern-Konsistenz
+    Verwendet den neuen ContentScorer für intelligente Inhaltsbewertung
     """
     
-    def __init__(self):
-        """Initialisiert den Validator"""
+    # Gewichte für Gesamt-Confidence (müssen sich zu 1.0 addieren)
+    WEIGHTS = {
+        'structure': 0.15,      # QR-Struktur korrekt
+        'pattern': 0.10,        # Muster-Check
+        'density': 0.05,        # Modul-Dichte
+        'decode': 0.20,         # Dekodierung erfolgreich
+        'content': 0.50         # Content-Score (Wörterbuch/URL)
+    }
+    
+    def __init__(self, debug_mode: bool = False):
+        """
+        Initialisiert den Validator
+        
+        Args:
+            debug_mode: Wenn True, werden Debug-Bilder gespeichert
+        """
+        self.debug_mode = debug_mode
         self.pyzbar_available = False
+        self.debug_counter = 0
+        
+        # Content-Scorer initialisieren
+        self.content_scorer = get_content_scorer()
+        
+        # Erstelle Debug-Ordner
+        if debug_mode:
+            os.makedirs('debug_qr_images', exist_ok=True)
+        
         try:
             import pyzbar.pyzbar as pyzbar
             self.pyzbar = pyzbar
             self.pyzbar_available = True
+            print("✓ pyzbar erfolgreich geladen")
         except ImportError:
             print("⚠️ pyzbar nicht installiert - Dekodierung eingeschränkt")
+            print("   Installation: pip install pyzbar")
+            print("   Windows: Zusätzlich zbar DLL benötigt!")
     
     def validate(self, matrix: QRMatrix) -> ValidationResult:
-        """
-        Validiert eine QR-Matrix und berechnet Confidence
-        
-        Args:
-            matrix: QRMatrix zum Validieren
-            
-        Returns:
-            ValidationResult mit allen Details
-        """
+        """Validiert eine QR-Matrix und berechnet Confidence"""
         binary = matrix.to_binary_grid()
+        debug_info = []
         
-        # Berechne Teil-Scores
+        # 1. Struktur-Check
         structure_score = self._check_structure(matrix)
+        debug_info.append(f"Structure: {structure_score*100:.1f}%")
+        
+        # 2. Pattern-Check
         pattern_score = self._check_patterns(binary)
+        debug_info.append(f"Pattern: {pattern_score*100:.1f}%")
+        
+        # 3. Dichte-Check
         density_score = self._check_density(binary)
+        debug_info.append(f"Density: {density_score*100:.1f}%")
         
-        # Versuche zu dekodieren
-        decoded_data, decode_score = self._try_decode(binary)
+        # 4. Dekodierung
+        decoded_data, decode_score, decode_debug = self._try_decode(binary)
+        debug_info.append(decode_debug)
         
-        # Gesamt-Confidence (gewichtet)
-        weights = {
-            'structure': 0.25,
-            'pattern': 0.20,
-            'density': 0.15,
-            'decode': 0.40
-        }
+        # 5. Content-Scoring (NEU)
+        content_result = self.content_scorer.score_content(decoded_data)
+        content_score = content_result.total_score
+        debug_info.append(f"Content: {content_score*100:.1f}%")
         
+        # Gesamt-Confidence berechnen
         confidence = (
-            structure_score * weights['structure'] +
-            pattern_score * weights['pattern'] +
-            density_score * weights['density'] +
-            decode_score * weights['decode']
+            structure_score * self.WEIGHTS['structure'] +
+            pattern_score * self.WEIGHTS['pattern'] +
+            density_score * self.WEIGHTS['density'] +
+            decode_score * self.WEIGHTS['decode'] +
+            content_score * self.WEIGHTS['content']
         ) * 100
         
-        is_valid = confidence > 50  # Threshold für "gültig"
+        # Wenn dekodiert UND guter Content-Score → Boost
+        if decoded_data and content_score > 0.5:
+            confidence = min(100.0, confidence * 1.1)
+        
+        # Wenn URL erkannt → zusätzlicher Boost
+        if content_result.is_url:
+            confidence = min(100.0, confidence + 5.0)
+        
+        is_valid = confidence > 40  # Threshold für "gültig"
         
         return ValidationResult(
             is_valid=is_valid,
@@ -98,20 +146,21 @@ class QRValidator:
             structure_score=structure_score * 100,
             pattern_score=pattern_score * 100,
             decode_score=decode_score * 100,
-            density_score=density_score * 100
+            density_score=density_score * 100,
+            content_score=content_score * 100,
+            is_url=content_result.is_url,
+            url_type=content_result.url_type,
+            german_words=len(content_result.german_matches),
+            english_words=len(content_result.english_matches),
+            debug_info=" | ".join(debug_info)
         )
     
     def _check_structure(self, matrix: QRMatrix) -> float:
-        """
-        Prüft strukturelle Integrität (Finder, Timing Patterns)
-        
-        Returns:
-            Score 0.0-1.0
-        """
+        """Prüft strukturelle Integrität"""
         score = 0.0
         checks = 0
         
-        # 1. Prüfe Finder Patterns (3 Stück)
+        # 1. Prüfe Finder Patterns
         finder_positions = [
             (0, 0),
             (0, matrix.size - 7),
@@ -170,16 +219,7 @@ class QRValidator:
             return False
     
     def _check_patterns(self, grid: np.ndarray) -> float:
-        """
-        Prüft typische QR-Code-Muster
-        
-        QR-Codes vermeiden bestimmte Muster:
-        - Zu viele gleiche Module in Folge
-        - Zu viele 2x2 Blöcke gleicher Farbe
-        
-        Returns:
-            Score 0.0-1.0
-        """
+        """Prüft typische QR-Code-Muster"""
         score = 1.0
         
         # Penalize lange Sequenzen gleicher Farbe
@@ -210,85 +250,106 @@ class QRValidator:
         return max(score, 0.0)
     
     def _check_density(self, grid: np.ndarray) -> float:
-        """
-        Prüft Modul-Dichte (typisch 40-60% schwarz)
-        
-        Returns:
-            Score 0.0-1.0
-        """
+        """Prüft Modul-Dichte"""
         total = grid.size
         black = np.sum(grid == 1)
         ratio = black / total
         
         # Ideal: 50%, acceptable: 40-60%
         if 0.40 <= ratio <= 0.60:
-            # Höherer Score je näher an 50%
             deviation = abs(ratio - 0.50)
-            score = 1.0 - (deviation * 10)  # Max deviation: 0.1 => -100%
+            score = 1.0 - (deviation * 10)
         else:
-            # Außerhalb akzeptablem Bereich
             if ratio < 0.40:
                 score = ratio / 0.40
-            else:  # ratio > 0.60
+            else:
                 score = (1.0 - ratio) / 0.40
         
         return max(score, 0.0)
     
-    def _try_decode(self, grid: np.ndarray) -> Tuple[Optional[str], float]:
+    def _try_decode(self, grid: np.ndarray) -> Tuple[Optional[str], float, str]:
         """
-        Versucht den QR-Code zu dekodieren
+        Versucht den QR-Code zu dekodieren (mit mehreren Strategien)
         
         Returns:
-            (decoded_data, score)
+            (decoded_data, score, debug_info)
         """
         if not self.pyzbar_available:
-            # Fallback: Simuliere Dekodierung basierend auf Struktur
-            print("⚠️ pyzbar nicht verfügbar - Dekodierung übersprungen")
-            return "[Simuliert: QR-Code]", 0.5
+            return None, 0.0, "pyzbar nicht verfügbar"
+        
+        debug_info = []
         
         try:
-            # Erstelle PIL Image aus Grid (RICHTIGE Orientierung)
-            # pyzbar erwartet: schwarz=0, weiß=255
-            img_array = np.uint8((1 - grid) * 255)  # Invertiere: 1 -> 0 (schwarz), 0 -> 255 (weiß)
+            # Strategie 1: Standard-Dekodierung
+            result = self._decode_attempt(grid, invert=False, scale=20)
+            if result:
+                debug_info.append(f"✓ Dekodiert: {result[:30]}...")
+                return result, 1.0, " | ".join(debug_info)
+            
+            # Strategie 2: Invertiert
+            result = self._decode_attempt(grid, invert=True, scale=20)
+            if result:
+                debug_info.append(f"✓ Invertiert: {result[:30]}...")
+                return result, 1.0, " | ".join(debug_info)
+            
+            # Strategie 3: Größere Skalierung
+            result = self._decode_attempt(grid, invert=False, scale=30)
+            if result:
+                debug_info.append(f"✓ Groß: {result[:30]}...")
+                return result, 1.0, " | ".join(debug_info)
+            
+            # Strategie 4: Invertiert + groß
+            result = self._decode_attempt(grid, invert=True, scale=30)
+            if result:
+                debug_info.append(f"✓ Inv+Groß: {result[:30]}...")
+                return result, 1.0, " | ".join(debug_info)
+            
+            debug_info.append("✗ Dekodierung fehlgeschlagen")
+            return None, 0.0, " | ".join(debug_info)
+        
+        except Exception as e:
+            debug_info.append(f"✗ Fehler: {str(e)}")
+            return None, 0.0, " | ".join(debug_info)
+    
+    def _decode_attempt(self, grid: np.ndarray, invert: bool, scale: int) -> Optional[str]:
+        """Ein Dekodierungs-Versuch mit spezifischen Parametern"""
+        try:
+            # Konvertiere zu Bild
+            if invert:
+                img_array = np.uint8(grid * 255)
+            else:
+                img_array = np.uint8((1 - grid) * 255)
+            
             img = Image.fromarray(img_array, mode='L')
             
-            # Scale up für bessere Erkennung (größer = besser)
-            scale = 20
+            # Skaliere hoch
             img = img.resize(
-                (grid.shape[1] * scale, grid.shape[0] * scale), 
+                (grid.shape[1] * scale, grid.shape[0] * scale),
                 Image.Resampling.NEAREST
             )
             
-            # Debug: Speichere Bild zum Testen (optional)
-            # img.save('debug_qr_decode.png')
+            # Debug: Speichere Bild
+            if self.debug_mode:
+                debug_filename = f'debug_qr_images/qr_decode_{self.debug_counter}_{("inv" if invert else "std")}_s{scale}.png'
+                img.save(debug_filename)
             
-            # Dekodiere mit pyzbar
+            # Dekodiere
             decoded = self.pyzbar.decode(img)
             
             if decoded and len(decoded) > 0:
-                try:
-                    data = decoded[0].data.decode('utf-8', errors='ignore')
-                    print(f"✓ QR dekodiert: {data[:50]}...")
-                    return data, 1.0  # Erfolgreich dekodiert = voller Score
-                except Exception as decode_err:
-                    print(f"⚠️ Dekodierungs-Fehler: {decode_err}")
-                    return None, 0.0
-            else:
-                # Kein QR-Code erkannt
-                return None, 0.0
+                data = decoded[0].data.decode('utf-8', errors='ignore')
+                return data
+            
+            return None
         
         except Exception as e:
-            print(f"❌ Dekodierungs-Exception: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, 0.0
+            if self.debug_mode:
+                print(f"  ✗ Dekodierungs-Fehler: {e}")
+            return None
+        finally:
+            self.debug_counter += 1
     
     def quick_validate(self, matrix: QRMatrix) -> bool:
-        """
-        Schnelle Validierung (nur Struktur, kein Dekodieren)
-        
-        Returns:
-            True wenn strukturell gültig
-        """
+        """Schnelle Validierung (nur Struktur)"""
         structure_score = self._check_structure(matrix)
         return structure_score > 0.8

@@ -1,14 +1,54 @@
 {
+    // Python-Interpreter und Pfade
     "python.analysis.extraPaths": [
-        "${workspaceFolder}"
+        "${workspaceFolder}",
+        "${workspaceFolder}/qr_reconstruction"
     ],
-    "python.analysis.typeCheckingMode": "basic",
-    "python.linting.pylintEnabled": false,
+    
+    // Linting-Einstellungen
     "python.linting.enabled": true,
-    "python.linting.pycodestyleEnabled": false,
+    "python.linting.pylintEnabled": false,
     "python.linting.flake8Enabled": true,
+    "python.linting.pycodestyleEnabled": false,
+    
+    // Flake8-Konfiguration (ignoriere häufige Probleme)
+    "python.linting.flake8Args": [
+        "--max-line-length=120",
+        "--ignore=E501,W503,E203,E402"
+    ],
+    
+    // Diagnostik-Overrides (unterdrücke nervige Warnungen)
     "python.analysis.diagnosticSeverityOverrides": {
         "reportMissingImports": "none",
-        "reportMissingTypeStubs": "none"
-    }
+        "reportMissingTypeStubs": "none",
+        "reportGeneralTypeIssues": "none",
+        "reportOptionalMemberAccess": "none",
+        "reportOptionalSubscript": "none",
+        "reportPrivateImportUsage": "none",
+        "reportUnboundVariable": "warning"
+    },
+    
+    // Editor-Einstellungen für Python
+    "[python]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.formatOnSave": false,
+        "editor.rulers": [100, 120]
+    },
+    
+    // Ignoriere bestimmte Dateien/Ordner
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true
+    },
+    
+    // Python-Testing
+    "python.testing.pytestEnabled": false,
+    "python.testing.unittestEnabled": false,
+    
+    // Bessere IntelliSense
+    "python.analysis.completeFunctionParens": true,
+    "python.analysis.autoImportCompletions": true
 }
