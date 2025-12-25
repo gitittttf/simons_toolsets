@@ -1,4 +1,4 @@
-from ...core.base_tool import BaseTool
+from core.base_tool import BaseTool
 from .ui.main_window import MainWindow
 import sys
 import os

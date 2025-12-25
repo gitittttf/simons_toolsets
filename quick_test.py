@@ -50,7 +50,7 @@ print(f"  Matrix erstellt: {matrix}")
 
 # SCHRITT 3: Teste die Validierung
 print("\n[Schritt 3] Teste Validierung...")
-validator = QRValidator(debug_mode=True)
+validator = QRValidator(debug_mode=False)
 result = validator.validate(matrix)
 
 print(f"\n  Ergebnis:")
