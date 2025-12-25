@@ -8,9 +8,9 @@ from PIL import Image
 import os
 
 # Importiere deine Module
-from qr_reconstruction.core.qr_matrix import QRMatrix, CellState
-from qr_reconstruction.core.validator import QRValidator
-from qr_reconstruction.core.bruteforce import BruteforceEngine
+from tools.qr_reconstruction.core.qr_matrix import QRMatrix, CellState
+from tools.qr_reconstruction.core.validator import QRValidator
+from tools.qr_reconstruction.core.bruteforce import BruteforceEngine
 
 print("="*60)
 print("QUICK TEST: QR-Code Rekonstruktion")
