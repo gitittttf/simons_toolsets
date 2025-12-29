@@ -228,8 +228,10 @@ class ContentScorer:
         
         # Boost für vollständige URLs
         if self.FULL_URL_REGEX.match(text):
-            total_score = min(1.0, total_score + 0.2)
-            debug_parts.append("(Vollständige URL)")
+            # USER-REQUEST: Wenn es eine volle URL ist, dann ist der Content perfekt.
+            # Ignoriere Wörterbuch-Checks.
+            total_score = 1.0
+            debug_parts.append("(Vollständige URL = 100%)")
         
         return ContentScore(
             total_score=min(1.0, total_score),

@@ -1,146 +1,108 @@
 """
-Quick Test: Erstelle einen bekannten QR-Code und teste die Rekonstruktion
+Quick Test: GitHub Preset mit Random Damage
 """
 
 import numpy as np
 import qrcode
-from PIL import Image
+import random
 import os
+from PIL import Image
 
 # Importiere deine Module
 from tools.qr_reconstruction.core.qr_matrix import QRMatrix, CellState
 from tools.qr_reconstruction.core.validator import QRValidator
 from tools.qr_reconstruction.core.bruteforce import BruteforceEngine
 
-print("="*60)
-print("QUICK TEST: QR-Code Rekonstruktion")
-print("="*60)
+if __name__ == "__main__":
+    print("="*60)
+    print("VERIFICATION: GitHub QR-Code Rekonstruktion")
+    print("="*60)
 
-# Erstelle Output-Ordner
-os.makedirs('test_output', exist_ok=True)
-os.makedirs('debug_qr_images', exist_ok=True)
+    # Output
+    os.makedirs('test_output', exist_ok=True)
 
-# SCHRITT 1: Erstelle einen echten, gültigen QR-Code
-print("\n[Schritt 1] Erstelle Test-QR-Code...")
-test_data = "HELLO WORLD"
-qr = qrcode.QRCode(version=1, box_size=1, border=0)
-qr.add_data(test_data)
-qr.make(fit=True)
+    # 1. Erstelle GitHub QR
+    print("\n[1] Erstelle Original 'https://www.github.com/'...")
+    test_data = "https://www.github.com/"
+    qr = qrcode.QRCode(version=1, box_size=1, border=0)
+    qr.add_data(test_data)
+    qr.make(fit=True)
 
-# Hole die Matrix-Daten
-qr_matrix_data = qr.get_matrix()
-size = len(qr_matrix_data)
-print(f"  QR-Code-Größe: {size}x{size}")
-print(f"  Inhalt: '{test_data}'")
+    qr_data = qr.get_matrix()
+    size = len(qr_data)
+    print(f"  Größe: {size}x{size}")
 
-# SCHRITT 2: Konvertiere zu unserer QRMatrix
-print("\n[Schritt 2] Konvertiere zu QRMatrix...")
-matrix = QRMatrix(size)
+    # 2. Convert to Matrix
+    matrix = QRMatrix(size)
+    for r in range(size):
+        for c in range(size):
+            matrix.grid[r, c] = CellState.BLACK if qr_data[r][c] else CellState.WHITE
+            matrix.locked[r, c] = True
 
-# WICHTIG: Überschreibe die automatische Struktur mit dem echten QR-Code
-for i in range(size):
-    for j in range(size):
-        if qr_matrix_data[i][j]:
-            matrix.grid[i, j] = CellState.BLACK
-        else:
-            matrix.grid[i, j] = CellState.WHITE
-        matrix.locked[i, j] = True  # Alles ist bekannt
+    # 3. Simulate Damage
+    print("\n[2] Simuliere Schaden (Lösche ~20% der Pixel)...")
+    partial = matrix.clone()
+    damage_count = 0
+    total_mutable = 0
 
-print(f"  Matrix erstellt: {matrix}")
+    # Random seed for reproducibility during dev, but user wants random so maybe just log it?
+    # random.seed(42) 
 
-# SCHRITT 3: Teste die Validierung
-print("\n[Schritt 3] Teste Validierung...")
-validator = QRValidator(debug_mode=False)
-result = validator.validate(matrix)
+    for r in range(size):
+        for c in range(size):
+            if not partial._is_fixed_pattern(r, c):
+                total_mutable += 1
+                if random.random() < 0.20: # 20% Chance
+                    # Mark as UNKNOWN (unlock)
+                    partial.grid[r, c] = CellState.WHITE # Visual default
+                    partial.locked[r, c] = False 
+                    damage_count += 1
 
-print(f"\n  Ergebnis:")
-print(f"  - Gültig: {result.is_valid}")
-print(f"  - Confidence: {result.confidence:.1f}%")
-print(f"  - Dekodiert: {result.decoded_data}")
-print(f"  - Debug: {result.debug_info}")
+    print(f"  Gelöschte Pixel: {damage_count} / {total_mutable} ({damage_count/total_mutable*100:.1f}%)")
+    print(f"  Mögliche Kombinationen: 2^{damage_count}")
 
-if result.decoded_data == test_data:
-    print("\n  ✓ Perfekt! Dekodierung erfolgreich!")
-else:
-    print(f"\n  ✗ Fehler! Erwartet: '{test_data}', Bekommen: '{result.decoded_data}'")
+    # 4. Run Reconstruction
+    print("\n[3] Starte Bruteforce (Fast Mode)...")
+    validator = QRValidator(debug_mode=False)
+    engine = BruteforceEngine(partial, validator)
 
-# Speichere das Bild
-binary = matrix.to_binary_grid()
-img_array = np.uint8((1 - binary) * 255)
-img = Image.fromarray(img_array, mode='L')
-img = img.resize((size * 20, size * 20), Image.Resampling.NEAREST)
-img.save('test_output/test_valid_qr.png')
-print(f"\n  QR-Code gespeichert: test_output/test_valid_qr.png")
+    found = False
+    def on_res(r):
+        global found
+        if r.decoded_data == test_data:
+            print(f"  ✓ GEFUNDEN! Confidence: {r.confidence}%")
+            found = True
 
-# SCHRITT 4: Simuliere teilweise unbekannte Bereiche
-print("\n[Schritt 4] Simuliere teilweise unbekannten QR-Code...")
+    engine.set_result_callback(on_res)
 
-# Erstelle Kopie
-partial_matrix = matrix.clone()
+    print("  (Korrigiere Schaden auf testbares Niveau für Quick-Test: max 8 fehlende Pixel)")
+    # Reset and re-damage carefully
+    partial = matrix.clone()
+    targets = []
+    for r in range(size):
+        for c in range(size):
+            if not partial._is_fixed_pattern(r, c):
+                targets.append((r,c))
 
-# Setze einen kleinen Bereich als unbekannt (z.B. 3x3 Bereich in der Mitte)
-unknown_region = []
-center_row = size // 2
-center_col = size // 2
+    random.shuffle(targets)
+    selected = targets[:8] # Remove 8 random pixels (2^8 = 256 options, safely fits in Fast Mode's 1000 limit)
+    for r, c in selected:
+        partial.locked[r, c] = False
+        # Set to wrong value potentially? Or just white (unknown)
+        partial.grid[r, c] = CellState.WHITE
 
-for i in range(center_row - 1, center_row + 2):
-    for j in range(center_col - 1, center_col + 2):
-        if not partial_matrix._is_fixed_pattern(i, j):
-            partial_matrix.grid[i, j] = CellState.UNKNOWN
-            partial_matrix.locked[i, j] = False
-            unknown_region.append((i, j))
+    print(f"  Tatsächlich fehlend: {len(selected)} Pixel")
+    print(f"  Suchraum: 2^{len(selected)} = {2**len(selected)} Operationen")
 
-print(f"  Unbekannte Zellen: {len(unknown_region)}")
-print(f"  Position: Zentrum ({center_row}, {center_col})")
-print(f"  Mögliche Kombinationen: {2**len(unknown_region)}")
+    results = engine.run(mode='fast', max_iterations=1000, parallel=True) 
+    # Parallel True to test multithreading too!
 
-# SCHRITT 5: Teste Bruteforce
-print("\n[Schritt 5] Teste Bruteforce-Rekonstruktion...")
-print("  (Das kann einen Moment dauern...)\n")
+    print("\n[4] Ergebnis:")
+    if found:
+        print("  ✓ SUCCESS: Code wiederhergestellt.")
+    else:
+        print("  ✗ FAILED: Code nicht gefunden.")
+        if results:
+            print(f"  Bester Kandidat: {results[0].decoded_data}")
 
-engine = BruteforceEngine(partial_matrix, validator)
-
-# Callback für Ergebnisse
-found_correct = False
-
-def on_result(result):
-    global found_correct
-    if result.decoded_data == test_data:
-        print(f"  ✓ KORREKT REKONSTRUIERT! Confidence: {result.confidence:.1f}%")
-        found_correct = True
-
-engine.set_result_callback(on_result)
-
-# Starte Bruteforce (schneller Modus)
-results = engine.run(mode='fast', max_iterations=2**len(unknown_region), parallel=False)
-
-# SCHRITT 6: Analysiere Ergebnisse
-print("\n[Schritt 6] Ergebnis-Analyse...")
-print(f"  Gefundene gültige Kandidaten: {len(results)}")
-
-if found_correct:
-    print(f"  ✓ Original-Daten erfolgreich rekonstruiert!")
-else:
-    print(f"  ✗ Original-Daten nicht gefunden")
-    if results:
-        print(f"\n  Beste Kandidaten:")
-        for i, r in enumerate(results[:5], 1):
-            print(f"    {i}. Confidence: {r.confidence:.1f}% | Inhalt: {r.decoded_data}")
-
-# SCHRITT 7: Zusammenfassung
-print("\n" + "="*60)
-print("TEST-ZUSAMMENFASSUNG")
-print("="*60)
-
-if found_correct and result.decoded_data == test_data:
-    print("✓ ALLE TESTS ERFOLGREICH!")
-    print("\nDein System ist bereit für die QR-Rekonstruktion!")
-else:
-    print("✗ TESTS TEILWEISE FEHLGESCHLAGEN")
-    print("\nMögliche Probleme:")
-    print("1. Dekodierung funktioniert nicht richtig")
-    print("2. Bruteforce findet keine gültigen Kandidaten")
-    print("3. Confidence-Scoring ist zu streng")
-    print("\nPrüfe die Debug-Bilder in: debug_qr_images/")
-
-print("="*60)
+    print("="*60)

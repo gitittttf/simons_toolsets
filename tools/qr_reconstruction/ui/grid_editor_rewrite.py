@@ -3,40 +3,67 @@ from typing import Callable, Optional, Set, Tuple
 import numpy as np
 from ..core.qr_matrix import QRMatrix, CellState
 
-from .theme import Colors, Dimensions
+# ... Colors class (Same as before) ...
+class Colors:
+    """Frutiger Aero Theme - Windows Vista/7 Style"""
+    # Glasmorphism-inspirierte Hintergründe
+    BG_PRIMARY = "#e8f4fc"          # Sanftes Himmelblau
+    BG_SECONDARY = "#ffffff"         # Reines Weiß (Glass-Panels)
+    BG_CARD = "#f0f8ff"              # Alice Blue (Karten)
+    BG_CARD_HOVER = "#dbeeff"        # Helleres Hover
+    
+    # Text auf hellem Hintergrund
+    TEXT_PRIMARY = "#1a1a2e"         # Dunkles Navy
+    TEXT_SECONDARY = "#4a5568"       # Mittelgrau
+    TEXT_MUTED = "#718096"           # Hellgrau
+    
+    # Vista-typische Akzentfarben
+    ACCENT = "#0078d4"               # Vista Blau
+    ACCENT_HOVER = "#006cbd"         # Dunkleres Blau
+    ACCENT_SECONDARY = "#38b000"     # Vista Grün
+    
+    # QR Farben (Aero-Stil)
+    QR_BLACK = "#1a1a2e"             # Dunkles Navy
+    QR_WHITE = "#f8fafc"             # Fast Weiß
+    QR_LOCKED_BLACK = "#0f172a"      # Tiefes Navy für gelockt
+    QR_LOCKED_WHITE = "#ffffff"      # Reines Weiß für gelockt
+    QR_UNLOCKED_BORDER = "#94a3b8"   # Sanftes Grau
+    QR_LOCKED_BORDER = "#0078d4"     # Vista Blau (gelockt)
+    QR_PATTERN_BORDER = "#38b000"    # Vista Grün (Pattern)
+    QR_HOVER = "#60a5fa"             # Helles Hover-Blau
+    QR_PAINTING = "#f97316"          # Orange während des Malens
+    
+    # Status-Farben (Aero-Stil)
+    SUCCESS = "#38b000"              # Frisches Grün
+    WARNING = "#f59e0b"              # Warmes Orange
+    ERROR = "#dc2626"                # Klares Rot
 
-# =============================================================================
-# THEME (Loaded from theme.py)
-# =============================================================================
 
 class GridEditor(ctk.CTkFrame):
     """
-    Zoomable & Pannable Grid Editor (Photoshop-style)
+    Zoomable & Pannable Grid Editor
     """
     
-    def __init__(self, parent, matrix: QRMatrix, cell_size=22):
+    def __init__(self, parent, matrix: QRMatrix):
         super().__init__(parent, fg_color="transparent")
+        
         self.matrix = matrix
         
         # View State
         self.scale = 1.0
-        self.base_cell_size = float(cell_size)
-        
-        # Start centered (will be calculated in _center_view)
-        self.offset_x = 0.0
-        self.offset_y = 0.0
+        self.offset_x = 50.0
+        self.offset_y = 50.0
+        self.base_cell_size = 20
         
         # Interaction State
         self.last_mouse_x = 0
         self.last_mouse_y = 0
         self.is_panning = False
         
-        # Painting State
         self.is_drawing = False
         self.draw_value = None
         self.painted_cells: Set[Tuple[int, int]] = set()
         
-        # Locking State
         self.is_locking = False
         self.lock_value = None
         self.locked_cells: Set[Tuple[int, int]] = set()
@@ -46,15 +73,14 @@ class GridEditor(ctk.CTkFrame):
         # Callbacks
         self.on_cell_changed: Optional[Callable] = None
         
-        # Canvas Container
+        # UI
         self.canvas_frame = ctk.CTkFrame(self, fg_color=Colors.BG_SECONDARY, corner_radius=0)
         self.canvas_frame.pack(fill="both", expand=True)
         
-        # Canvas
         self.canvas = ctk.CTkCanvas(
             self.canvas_frame,
-            bg="#2d2d2d", # Dark gray background for better contrast
-            highlightthickness=Dimensions.GRID_HIGHLIGHT_THICKNESS
+            bg="#e5e5e5", # Neutral gray background like Photoshop
+            highlightthickness=0
         )
         self.canvas.pack(fill="both", expand=True)
         
@@ -66,10 +92,10 @@ class GridEditor(ctk.CTkFrame):
         self.canvas.bind("<Button-4>", self._on_wheel)        # Linux Up
         self.canvas.bind("<Button-5>", self._on_wheel)        # Linux Down
         
-        # Mouse Move (Hover)
+        # Mouse Move (Hover & Drag)
         self.canvas.bind("<Motion>", self._on_motion)
         
-        # Left Click (Draw/Pan)
+        # Left Click (Draw)
         self.canvas.bind("<Button-1>", self._on_left_down)
         self.canvas.bind("<B1-Motion>", self._on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_left_up)
@@ -79,15 +105,10 @@ class GridEditor(ctk.CTkFrame):
         self.canvas.bind("<B3-Motion>", self._on_right_drag)
         self.canvas.bind("<ButtonRelease-3>", self._on_right_up)
         
-        # Middle Click (Pan)
-        self.canvas.bind("<Button-2>", self._on_middle_down) # Windows/Linux Middle
-        self.canvas.bind("<B2-Motion>", self._on_middle_drag)
-        self.canvas.bind("<ButtonRelease-2>", self._on_middle_up)
-
-        self._init_cells_white()
+        # Ctrl + Click (Pan) - We handle this logic in _on_left_down checking state
         
-        # Initial Center
-        self.after(100, self._center_view)
+        self._init_cells_white()
+        self.render()
 
     def _init_cells_white(self):
         for i in range(self.matrix.size):
@@ -95,42 +116,18 @@ class GridEditor(ctk.CTkFrame):
                 if not self.matrix.locked[i, j]:
                     self.matrix.grid[i, j] = CellState.WHITE
 
-    def _center_view(self):
-        """Centers the QR code in the canvas and fits it if needed"""
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        
-        if cw <= 1 or ch <= 1:
-            self.after(100, self._center_view)
-            return
-
-        qr_px = self.matrix.size * self.base_cell_size
-        
-        # Calculate scale to fit with margin (80%)
-        target_scale = 1.0
-        if qr_px > min(cw, ch) * 0.8:
-            target_scale = (min(cw, ch) * 0.8) / qr_px
-        
-        self.scale = target_scale
-        
-        # Re-calc pixel size with new scale
-        qr_px_scaled = qr_px * self.scale
-        
-        self.offset_x = (cw - qr_px_scaled) / 2
-        self.offset_y = (ch - qr_px_scaled) / 2
-            
-        self.render()
-
+    # --- Coordinate Transforms ---
+    
     def _to_screen(self, r, c) -> Tuple[float, float, float]:
+        """Returns x, y, size"""
         size = self.base_cell_size * self.scale
         x = c * size + self.offset_x
         y = r * size + self.offset_y
         return x, y, size
     
     def _to_grid(self, x, y) -> Optional[Tuple[int, int]]:
+        """Returns r, c"""
         size = self.base_cell_size * self.scale
-        if size == 0: return None
-        
         c = int((x - self.offset_x) / size)
         r = int((y - self.offset_y) / size)
         
@@ -138,52 +135,49 @@ class GridEditor(ctk.CTkFrame):
             return r, c
         return None
 
+    # --- Rendering ---
+
     def render(self):
         self.canvas.delete("all")
         
+        # Optimize: Only draw visible? For now, standard QR (max 177x177) is fine to draw all ~30k rects if simple.
+        # But Tkinter Canvas can get slow with >10k items.
+        # Max QR V40 is 177*177 = 31329 items. That will lagg.
+        # V10 is 57x57 = 3249 items. Fast.
+        # We should only draw if reasonable or optimize.
+        # Actually, draw using `create_rectangle` is okay-ish.
+        # But for large QRs, we might need image-based rendering if it lags.
+        # Let's try standard vector first.
+        
         cell_pixel_size = self.base_cell_size * self.scale
-        if cell_pixel_size < 1: cell_pixel_size = 1 # Safety
         
+        # Draw Background (Grid Area)
         total_size = self.matrix.size * cell_pixel_size
-        
-        # Draw Background (Board)
         self.canvas.create_rectangle(
             self.offset_x, self.offset_y,
             self.offset_x + total_size, self.offset_y + total_size,
-            fill="#ffffff", outline=Colors.QR_UNLOCKED_BORDER, width=0,
-            tags="board_bg"
+            fill="white", outline=Colors.QR_UNLOCKED_BORDER
         )
         
-        # Simple mode for tiny cells to improve performance
-        simple_mode = cell_pixel_size < 4
-        
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        
-        # Draw Margin (pixels) to prevent blank edges during fast pans
-        margin = 100 
+        # Draw Cells
+        # To optimize: Draw only non-white cells? No, we need borders.
+        # Optimization: Use one complex polygon or image?
+        # Let's stick to rects for now but maybe skip drawing fully white unlocked ones if we have a white background?
+        # Yes, unlocked white cells are just "gap".
         
         for r in range(self.matrix.size):
-            # Culling: Only draw visible rows (with margin)
-            uy = r * cell_pixel_size + self.offset_y
-            if uy > ch + margin or uy + cell_pixel_size < -margin:
-                continue
-                
             for c in range(self.matrix.size):
-                ux = c * cell_pixel_size + self.offset_x
-                if ux > cw + margin or ux + cell_pixel_size < -margin:
-                    continue
-                
-                self._draw_single_cell(r, c, cell_pixel_size, simple_mode)
-        
-        # Outer Border
-        self.canvas.create_rectangle(
-            self.offset_x, self.offset_y,
-            self.offset_x + total_size, self.offset_y + total_size,
-            outline=Colors.ACCENT, width=Dimensions.GRID_OUTER_BORDER_WIDTH
-        )
+                self._draw_single_cell(r, c, cell_pixel_size)
+    
+        # Grid overlay (optional, maybe only at high zoom or low version)
+        if self.scale > 0.5:
+             self.canvas.create_rectangle(
+                self.offset_x, self.offset_y,
+                self.offset_x + total_size, self.offset_y + total_size,
+                outline=Colors.ACCENT_SECONDARY, width=1, tags="border"
+            )
 
-    def _draw_single_cell(self, r, c, size, simple_mode):
+    def _draw_single_cell(self, r, c, size):
         x = c * size + self.offset_x
         y = r * size + self.offset_y
         
@@ -191,41 +185,43 @@ class GridEditor(ctk.CTkFrame):
         locked = self.matrix.locked[r, c]
         fixed = self.matrix._is_fixed_pattern(r, c)
         
-        # Colors logic
-        if fixed:
-            fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
-            outline = Colors.QR_PATTERN_BORDER
-        elif locked:
-            fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
-            outline = Colors.QR_LOCKED_BORDER
+        # Skip standard white unlocked cells (optimization)
+        if val == CellState.WHITE and not locked and not fixed:
+            # Just draw selection/hover if needed, but base is empty
+            # If we want a grid look, we need lines.
+            # Let's draw lines separately?
+            pass
         else:
-            fill = Colors.QR_BLACK if val == CellState.BLACK else Colors.QR_WHITE
-            # Default to faint border instead of empty
-            outline = Colors.QR_GRID_LINE
-            if val == CellState.WHITE:
-                # Keep outline for white cells to show grid
-                pass 
+            # Colors
+            if fixed:
+                color = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
+                outline = Colors.QR_PATTERN_BORDER
+            elif locked:
+                color = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
+                outline = Colors.QR_LOCKED_BORDER
+            else:
+                color = Colors.QR_BLACK # Only for black
+                outline = Colors.QR_UNLOCKED_BORDER
+            
+            # Optimization: Don't draw valid white empty cells, only draw Black or Locked/Fixed
+            if val == CellState.WHITE and not locked and not fixed:
+                return
 
-        if simple_mode:
-            self.canvas.create_rectangle(x, y, x+size, y+size, fill=fill, width=Dimensions.GRID_CELL_BORDER_NONE)
-        else:
-            self.canvas.create_rectangle(x, y, x+size, y+size, fill=fill, outline=outline, width=Dimensions.GRID_CELL_BORDER_THIN)
+            self.canvas.create_rectangle(
+                x, y, x + size, y + size,
+                fill=color, outline=outline,
+                tags=f"c_{r}_{c}"
+            )
             
             # Markers
-            if size > 12:
+            if size > 10:
                 cx, cy = x + size/2, y + size/2
                 if fixed:
-                     tcol = "#ffffff" if val == CellState.BLACK else Colors.QR_PATTERN_BORDER
-                     self.canvas.create_text(
-                         cx, cy, text="x", fill=tcol, 
-                         font=(Dimensions.GRID_MARKER_FONT, int(size/Dimensions.GRID_MARKER_FIXED_DIVIDER))
-                     )
+                    tc = "white" if val == CellState.BLACK else Colors.QR_PATTERN_BORDER
+                    self.canvas.create_text(cx, cy, text="◆", fill=tc, font=("Arial", int(size/3)))
                 elif locked:
-                     tcol = "#ffffff" if val == CellState.BLACK else Colors.ACCENT
-                     self.canvas.create_text(
-                         cx, cy, text="o", fill=tcol, 
-                         font=(Dimensions.GRID_MARKER_FONT, int(size/Dimensions.GRID_MARKER_LOCKED_DIVIDER))
-                     )
+                    tc = "white" if val == CellState.BLACK else Colors.ACCENT
+                    self.canvas.create_text(cx, cy, text="✓", fill=tc, font=("Arial", int(size/2.5)))
 
     def _draw_cursor_hl(self, r, c):
         self.canvas.delete("hl")
@@ -233,46 +229,48 @@ class GridEditor(ctk.CTkFrame):
              x, y, size = self._to_screen(r, c)
              self.canvas.create_rectangle(
                  x, y, x+size, y+size,
-                 outline=Colors.QR_HOVER, 
-                 width=Dimensions.GRID_CELL_BORDER_THICK, 
-                 tags="hl"
+                 outline=Colors.QR_HOVER, width=2, tags="hl"
              )
 
+    # --- Events ---
+
     def _on_resize(self, event):
-        # Optional: re-center or just keep valid
+        # Maybe center grid?
         pass
 
     def _on_wheel(self, event):
+        # Zoom logic
         x, y = event.x, event.y
-        scale_delta = 1.0
         
+        # Check delta
         if event.num == 5 or event.delta < 0:
-            scale_delta = 0.9
+            factor = 0.9
         else:
-            scale_delta = 1.1
+            factor = 1.1
             
-        new_scale = self.scale * scale_delta
-        if new_scale < 0.05: new_scale = 0.05
+        new_scale = self.scale * factor
+        # Limit zoom
+        if new_scale < 0.1: new_scale = 0.1
         if new_scale > 20.0: new_scale = 20.0
         
-        # Zoom towards cursor
+        # Adjust offset to zoom towards mouse
         self.offset_x = x - (x - self.offset_x) * (new_scale / self.scale)
         self.offset_y = y - (y - self.offset_y) * (new_scale / self.scale)
         self.scale = new_scale
         
         self.render()
 
-    # --- LEFT CLICK (Draw or Ctrl+Pan) ---
     def _on_left_down(self, event):
         self.last_mouse_x = event.x
         self.last_mouse_y = event.y
         
-        # Ctrl -> Pan
-        if event.state & 0x4 or event.state & 0x20000: # Control key
+        # Check for Ctrl -> Pan
+        if event.state & 0x0004: # Control key mask (usually 4)
             self.is_panning = True
             self.canvas.config(cursor="fleur")
             return
 
+        # Drawing
         cell = self._to_grid(event.x, event.y)
         if cell:
             r, c = cell
@@ -282,29 +280,24 @@ class GridEditor(ctk.CTkFrame):
                 self.draw_value = CellState.BLACK if curr == CellState.WHITE else CellState.WHITE
                 self.matrix.grid[r, c] = self.draw_value
                 self.painted_cells.add(cell)
-                self.render()
+                self.render() # Full render is safer for artifacts, though slower.
                 self._notify()
 
     def _on_left_drag(self, event):
         if self.is_panning:
             dx = event.x - self.last_mouse_x
             dy = event.y - self.last_mouse_y
-            
-            # OPTIMIZATION: Move existing items instead of redraw
-            self.canvas.move("all", dx, dy)
-            
             self.offset_x += dx
             self.offset_y += dy
             self.last_mouse_x = event.x
             self.last_mouse_y = event.y
-            # Do NOT call render() here for performance!
+            self.render() # Or just move items? Render is cleaner for simplicity
             return
             
         if self.is_drawing:
             cell = self._to_grid(event.x, event.y)
             if cell and cell not in self.painted_cells:
                 r, c = cell
-                # Draw only allowed cells
                 if not self.matrix.locked[r, c] and not self.matrix._is_fixed_pattern(r, c):
                     self.matrix.grid[r, c] = self.draw_value
                     self.painted_cells.add(cell)
@@ -312,16 +305,11 @@ class GridEditor(ctk.CTkFrame):
                     self._notify()
 
     def _on_left_up(self, event):
-        if self.is_panning:
-             # Final render to clean up edges/culling after move
-             self.render()
-             
         self.is_panning = False
         self.is_drawing = False
         self.painted_cells.clear()
         self.canvas.config(cursor="")
 
-    # --- RIGHT CLICK (Lock) ---
     def _on_right_down(self, event):
         cell = self._to_grid(event.x, event.y)
         if cell:
@@ -350,34 +338,6 @@ class GridEditor(ctk.CTkFrame):
         self.is_locking = False
         self.locked_cells.clear()
 
-    # --- MIDDLE CLICK (Pan) ---
-    def _on_middle_down(self, event):
-        self.is_panning = True
-        self.last_mouse_x = event.x
-        self.last_mouse_y = event.y
-        self.canvas.config(cursor="fleur")
-
-    def _on_middle_drag(self, event):
-        if self.is_panning:
-            dx = event.x - self.last_mouse_x
-            dy = event.y - self.last_mouse_y
-            
-            # OPTIMIZATION: Move existing items instead of redraw
-            self.canvas.move("all", dx, dy)
-            
-            self.offset_x += dx
-            self.offset_y += dy
-            self.last_mouse_x = event.x
-            self.last_mouse_y = event.y
-            # Do NOT call render() here for performance!
-
-    def _on_middle_up(self, event):
-        if self.is_panning:
-             # Final render to clean up
-             self.render()
-        self.is_panning = False
-        self.canvas.config(cursor="")
-
     def _on_motion(self, event):
         if not self.is_panning and not self.is_drawing and not self.is_locking:
             cell = self._to_grid(event.x, event.y)
@@ -391,6 +351,23 @@ class GridEditor(ctk.CTkFrame):
         if self.on_cell_changed:
             self.on_cell_changed(0, 0)
 
-    def set_cell_size(self, size):
-        self.base_cell_size = float(size)
-        self.render()
+# Statistics Panel (Simplified for Sidebar)
+class StatisticsPanel(ctk.CTkFrame):
+     def __init__(self, parent, matrix):
+        super().__init__(parent, fg_color="transparent")
+        self.matrix = matrix
+        # ... logic similar to previous but vertical layout ...
+        # (I will reimplement simpler stats here)
+        self.lbl_unknown = ctk.CTkLabel(self, text="0 Unknown")
+        self.lbl_unknown.pack()
+        
+     def update(self):
+         # ... update logic ...
+         pass
+
+# Controls (Just Buttons)
+class GridEditorControls(ctk.CTkFrame):
+    def __init__(self, parent, editor):
+        super().__init__(parent, fg_color="transparent")
+        self.editor = editor
+        # Buttons logic

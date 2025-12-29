@@ -33,7 +33,20 @@ class BaseTool(ABC):
     @abstractmethod
     def run(self):
         """
-        Startet das Tool. 
-        Dies ist der Einstiegspunkt wenn das Tool ausgewählt wird.
+        Main entry point for the tool (CLI/Standalone).
+        """
+        pass
+        
+    def launch_gui(self, parent_window):
+        """
+        Optional: Launches the tool's GUI as a child/toplevel window.
+        Returns the window instance.
+        """
+        raise NotImplementedError("GUI launch not implemented for this tool")
+
+    def cleanup(self):
+        """
+        Optional: Called when the tool is closed or the app shuts down.
+        Should clean up threads, processes, temporary files, etc.
         """
         pass

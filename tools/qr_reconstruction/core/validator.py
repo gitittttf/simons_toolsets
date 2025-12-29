@@ -237,14 +237,30 @@ class QRValidator:
             return False
     
     def _check_patterns(self, grid: np.ndarray) -> float:
-        """Prüft typische QR-Code-Muster"""
+        """Prüft typische QR-Code-Muster (ignoriert Finder Patterns)"""
         score = 1.0
+        size = grid.shape[0]
         
-        # Penalize lange Sequenzen gleicher Farbe
+        # Helfer: Prüft ob Koordinate im Finder-Pattern liegt (7x7 Ecken)
+        def is_finder(r, c):
+            # Top-Left
+            if r < 7 and c < 7: return True
+            # Top-Right
+            if r < 7 and c >= size - 7: return True
+            # Bottom-Left
+            if r >= size - 7 and c < 7: return True
+            return False
+            
+        # Penalize lange Sequenzen gleicher Farbe (nur im Datenbereich)
         max_run_penalty = 0
-        for i in range(grid.shape[0]):
+        for i in range(size):
             run_length = 1
-            for j in range(1, grid.shape[1]):
+            for j in range(1, size):
+                # Skip wenn wir im Finder Pattern sind
+                if is_finder(i, j):
+                    run_length = 0 # Reset
+                    continue
+                    
                 if grid[i, j] == grid[i, j-1]:
                     run_length += 1
                 else:
@@ -255,10 +271,14 @@ class QRValidator:
         
         score -= min(max_run_penalty * 0.05, 0.3)
         
-        # Penalize zu viele 2x2 Blöcke
+        # Penalize zu viele 2x2 Blöcke (ignoriere Finder Patterns)
         block_penalty = 0
-        for i in range(grid.shape[0] - 1):
-            for j in range(grid.shape[1] - 1):
+        for i in range(size - 1):
+            for j in range(size - 1):
+                # Wenn irgendein Teil des 2x2 Blocks im Finder ist -> Skip
+                if is_finder(i, j) or is_finder(i+1, j+1):
+                    continue
+                    
                 block = grid[i:i+2, j:j+2]
                 if np.all(block == block[0, 0]):
                     block_penalty += 1
@@ -330,29 +350,38 @@ class QRValidator:
             return None, 0.0, " | ".join(debug_info)
     
     def _decode_attempt(self, grid: np.ndarray, invert: bool, scale: int) -> Optional[str]:
-        """Ein Dekodierungs-Versuch mit spezifischen Parametern"""
+        """Ein Dekodierungs-Versuch mit optimierter NumPy-Performance"""
         try:
-            # Konvertiere zu Bild
+            # 1. Konvertiere zu uint8 (0 oder 255)
+            # Invertierung direkt im Numpy Array
             if invert:
-                img_array = np.uint8(grid * 255)
+                # grid ist 0/1 -> invertiert: 1/0 -> * 255
+                img_array = (grid * 255).astype(np.uint8)
             else:
-                img_array = np.uint8((1 - grid) * 255)
+                # grid ist 0/1 -> normal: 0(weiß)/1(schwarz). 
+                # QR Code Standard: 0=White, 1=Black. 
+                # Pyzbar/Images erwarten oft: 0=Black, 255=White (Luminance)
+                # Halt, QR Matrix: 0=White, 1=Black (in Core Logic)
+                # Bild: 255=White, 0=Black.
+                # Also: 0 -> 255, 1 -> 0.
+                # Formel: (1 - grid) * 255
+                img_array = ((1 - grid) * 255).astype(np.uint8)
             
-            img = Image.fromarray(img_array, mode='L')
+            # 2. Schnelles Upscaling mit Numpy (statt PIL.resize)
+            # repeat() ist extrem effizient für Nearest-Neighbor Integer-Scaling
+            if scale > 1:
+                img_array = img_array.repeat(scale, axis=0).repeat(scale, axis=1)
             
-            # Skaliere hoch
-            img = img.resize(
-                (grid.shape[1] * scale, grid.shape[0] * scale),
-                Image.Resampling.NEAREST
-            )
-            
-            # Debug: Speichere Bild
+            # Debug: Speichere Bild (nur wenn nötig PIL importieren/nutzen)
             if self.debug_mode:
                 debug_filename = f'debug_qr_images/qr_decode_{self.debug_counter}_{("inv" if invert else "std")}_s{scale}.png'
-                img.save(debug_filename)
+                try:
+                    Image.fromarray(img_array).save(debug_filename)
+                except Exception:
+                    pass
             
-            # Dekodiere
-            decoded = self.pyzbar.decode(img)
+            # 3. Direktes Dekodieren des Numpy Arrays (spart PIL Konvertierung)
+            decoded = self.pyzbar.decode(img_array)
             
             if decoded and len(decoded) > 0:
                 data = decoded[0].data.decode('utf-8', errors='ignore')
