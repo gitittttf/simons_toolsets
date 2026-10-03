@@ -5,3 +5,4 @@ test_output/
 .vscode/
 .idea/
 *.egg-info/
+.pytest_cache/

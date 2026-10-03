@@ -8,11 +8,14 @@ basierend auf:
 - Text-Lesbarkeit
 """
 
+import logging
 import re
 import os
 from dataclasses import dataclass
 from typing import List, Set, Tuple, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -117,11 +120,11 @@ class ContentScorer:
                         for line in f 
                         if line.strip() and len(line.strip()) >= 3
                     }
-                print(f"✓ Deutsches Wörterbuch geladen: {len(self.german_words):,} Wörter")
+                logger.debug("Deutsches Wörterbuch geladen: %d Wörter", len(self.german_words))
             except Exception as e:
-                print(f"⚠️ Fehler beim Laden des deutschen Wörterbuchs: {e}")
+                logger.warning("Fehler beim Laden des deutschen Wörterbuchs: %s", e)
         else:
-            print(f"⚠️ Deutsches Wörterbuch nicht gefunden: {german_file}")
+            logger.warning("Deutsches Wörterbuch nicht gefunden: %s", german_file)
             # Fallback: Einige häufige deutsche Wörter
             self.german_words = self._get_fallback_german_words()
         
@@ -134,11 +137,11 @@ class ContentScorer:
                         for line in f 
                         if line.strip() and len(line.strip()) >= 3
                     }
-                print(f"✓ Englisches Wörterbuch geladen: {len(self.english_words):,} Wörter")
+                logger.debug("Englisches Wörterbuch geladen: %d Wörter", len(self.english_words))
             except Exception as e:
-                print(f"⚠️ Fehler beim Laden des englischen Wörterbuchs: {e}")
+                logger.warning("Fehler beim Laden des englischen Wörterbuchs: %s", e)
         else:
-            print(f"⚠️ Englisches Wörterbuch nicht gefunden: {english_file}")
+            logger.warning("Englisches Wörterbuch nicht gefunden: %s", english_file)
             # Fallback: Einige häufige englische Wörter
             self.english_words = self._get_fallback_english_words()
     

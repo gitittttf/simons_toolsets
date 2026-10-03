@@ -64,7 +64,6 @@ if __name__ == "__main__":
     # 4. Run Reconstruction
     print("\n[3] Starte Bruteforce (Fast Mode)...")
     validator = QRValidator(debug_mode=False)
-    engine = BruteforceEngine(partial, validator)
 
     found = False
     def on_res(r):
@@ -73,7 +72,6 @@ if __name__ == "__main__":
             print(f"  ✓ GEFUNDEN! Confidence: {r.confidence}%")
             found = True
 
-    engine.set_result_callback(on_res)
 
     print("  (Korrigiere Schaden auf testbares Niveau für Quick-Test: max 8 fehlende Pixel)")
     # Reset and re-damage carefully
@@ -94,6 +92,9 @@ if __name__ == "__main__":
     print(f"  Tatsächlich fehlend: {len(selected)} Pixel")
     print(f"  Suchraum: 2^{len(selected)} = {2**len(selected)} Operationen")
 
+    # Engine erst jetzt erzeugen: sie liest die unbekannten Zellen beim Erstellen
+    engine = BruteforceEngine(partial, validator)
+    engine.set_result_callback(on_res)
     results = engine.run(mode='fast', max_iterations=1000, parallel=True) 
     # Parallel True to test multithreading too!
 

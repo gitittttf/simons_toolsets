@@ -9,6 +9,7 @@ Features:
 
 import customtkinter as ctk
 from tkinter import messagebox
+import queue
 import threading
 import sys
 from typing import Optional
@@ -27,51 +28,32 @@ def setup_theme():
 # =============================================================================
 # HAUPTFENSTER
 # =============================================================================
-# =============================================================================
-# HAUPTFENSTER
-# =============================================================================
 class MainWindowMixin:
-    """Shared implementation for both Standalone (CTk) and Hub-Tool (CTkToplevel)"""
-    
+    """Gemeinsame Implementierung für Standalone (CTk) und Hub-Tool (CTkToplevel)"""
+
     def _init_shared(self, is_standalone=True):
         self.is_standalone = is_standalone
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-
-
-class MainWindow(ctk.CTk, MainWindowMixin):
-    """Standalone Root Window"""
-    def __init__(self, is_standalone=True):
-        super().__init__()
-        self._init_shared(is_standalone=True)
-
-class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
-    """Child Window for Hub"""
-    def __init__(self):
-        super().__init__()
-        self._init_shared(is_standalone=False)
-        # Toplevel specifics
-        self.after(200, lambda: self.focus())
-
         setup_theme()
-        
+
         self.title("✨ QR-Code Rekonstruktion ✨")
         self.geometry("1550x980")
         self.minsize(1200, 800)
         self.configure(fg_color=Colors.BG_PRIMARY)
-        
+
         # State
         self.matrix: Optional[QRMatrix] = None
         self.validator = QRValidator()
         self.bruteforce_engine: Optional[BruteforceEngine] = None
         self.bruteforce_thread: Optional[threading.Thread] = None
         self.is_running = False
-        
+
         # UI Components
         self.grid_editor: Optional[GridEditor] = None
-        self.editor_controls: Optional[GridEditorControls] = None
+        self.editor_controls = None
         self.results_view: Optional[ResultsView] = None
-        
+
         self._build_start_screen()
 
     def _on_close(self):
@@ -89,49 +71,6 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             # Actually, launcher.py overwrites it AFTER launch_gui returns. 
             # So this method might be overwritten by launcher. But to be safe:
             self.withdraw() # Default to hide
-
-    # ... (Theme code skipped) ...
-
-    def _on_progress(self, tested, valid, total):
-        # FIX: Ensure main thread update
-        # Using separate thread for callbacks might be risky.
-        try:
-            # Check if window still exists
-            if not self.winfo_exists(): return 
-            
-            # Schedule update
-            self.after(10, lambda t=tested, v=valid, tot=total: self._update_progress_ui(t, v, tot))
-        except:
-            pass
-
-    def _update_progress_ui(self, tested, valid, total):
-        try:
-            self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")
-        except:
-            pass
-    
-    def _on_result(self, result):
-        try:
-            if not self.winfo_exists(): return
-            self.after(10, lambda r=result: self.results_view.add_result(r))
-        except:
-            pass
-    
-    def _on_complete(self, results):
-        self.is_running = False
-        try:
-            self.progress_bar.stop()
-            self.progress_bar.pack_forget()
-            self.btn_stop.configure(state="normal", text="✓ Fertig", command=self._back, fg_color=Colors.SUCCESS, text_color="#ffffff", hover_color="#2e8b57")
-            
-            stats = self.bruteforce_engine.get_stats()
-            # Only show messagebox if window is focused/active
-            messagebox.showinfo("Fertig", f"Tests: {stats['tested']:,}\nGültig: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s", parent=self)
-        except:
-            pass
-
-    # ... (Rest of code) ...
-    
 
     def _build_start_screen(self):
         """Start-Screen mit Versionsauswahl"""
@@ -611,59 +550,48 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             max_time = 120
         
         self.is_running = True
-        self.bruteforce_engine = BruteforceEngine(self.matrix, self.validator)
-        
-        # --- THREAD SAFETY FIX ---
-        import queue
-        self.msg_queue = queue.Queue()
-        
-        def on_progress(p, v, m): # Args: tested, valid, max
-            self.msg_queue.put(("progress", (p, v, m)))
-            
-        def on_result(r):
-            self.msg_queue.put(("result", r))
-            
-        self.bruteforce_engine.set_progress_callback(on_progress)
-        self.bruteforce_engine.set_result_callback(on_result)
-        
+        engine = BruteforceEngine(self.matrix, self.validator)
+        self.bruteforce_engine = engine
+
+        # Worker-Thread kommuniziert nur über seine eigene Queue mit der UI.
+        # Lokale Variable statt self.msg_queue, damit ein alter Lauf nie in die Queue eines neuen schreibt.
+        msg_queue = queue.Queue()
+        self.msg_queue = msg_queue
+
+        engine.set_progress_callback(lambda tested, valid, total: msg_queue.put(("progress", (tested, valid, total))))
+        engine.set_result_callback(lambda result: msg_queue.put(("result", result)))
+
         def run():
-            results = self.bruteforce_engine.run(mode=mode, max_iterations=max_iter, max_time=max_time, parallel=True)
-            self.msg_queue.put(("complete", results))
-        
+            results = engine.run(mode=mode, max_iterations=max_iter, max_time=max_time, parallel=True)
+            msg_queue.put(("complete", results))
+
         self.bruteforce_thread = threading.Thread(target=run, daemon=True)
         self.bruteforce_thread.start()
-        
-        # Start Polling
-        self._check_queue()
 
-    def _check_queue(self):
-        """Polls the queue for messages from the worker thread"""
-        if not self.winfo_exists():
+        self._check_queue(msg_queue)
+
+    def _check_queue(self, msg_queue):
+        """Pollt die Queue des Worker-Threads (läuft im Tk-Main-Thread)"""
+        # Ein Lauf, der per "Zurück" verlassen oder durch einen neuen ersetzt wurde, pollt nicht weiter
+        if not self.winfo_exists() or not self.is_running or msg_queue is not self.msg_queue:
             return
-            
+
         try:
-            import queue
             while True:
-                msg = self.msg_queue.get_nowait()
-                m_type, data = msg
-                
+                m_type, data = msg_queue.get_nowait()
+
                 if m_type == "progress":
-                    # data is (tested, valid, max)
-                    # We can update the UI here if we have a progress callback target
-                    # But the previous implementation called self._on_progress
-                    # Let's adapt it.
-                    pass 
+                    self._update_progress_ui(*data)
                 elif m_type == "result":
-                    self._on_result(data)
+                    self.results_view.add_result(data)
                 elif m_type == "complete":
                     self._on_complete(data)
                     return # Stop polling
-                    
+
         except queue.Empty:
             pass
-            
-        if self.is_running:
-            self.after(50, self._check_queue)
+
+        self.after(50, self._check_queue, msg_queue)
 
 
     def _build_results_view(self):
@@ -717,27 +645,9 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             corner_radius=Dimensions.CORNER_RADIUS_M
         ).pack(side="left", padx=20, pady=12)
     
-    def _on_progress(self, tested, valid, total):
-        # FIX: Ensure main thread update
-        try:
-            if not self.winfo_exists(): return 
-            self.after(10, lambda t=tested, v=valid, tot=total: self._update_progress_ui(t, v, tot))
-        except:
-            pass
-
     def _update_progress_ui(self, tested, valid, total):
-        try:
-            self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")
-        except:
-            pass
-    
-    def _on_result(self, result):
-        try:
-            if not self.winfo_exists(): return
-            self.after(10, lambda r=result: self.results_view.add_result(r))
-        except:
-            pass
-    
+        self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")
+
     def _on_complete(self, results):
         self.is_running = False
         self.progress_bar.stop()
@@ -757,7 +667,23 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             if not messagebox.askyesno("Abbrechen?", "Noch am Laufen. Wirklich abbrechen?", parent=self):
                 return
             self._stop()
+            self.is_running = False
         self._build_editor_view()
+
+
+class MainWindow(MainWindowMixin, ctk.CTk):
+    """Standalone-Hauptfenster"""
+    def __init__(self, is_standalone=True):
+        super().__init__()
+        self._init_shared(is_standalone=is_standalone)
+
+
+class MainWindowToplevel(MainWindowMixin, ctk.CTkToplevel):
+    """Kindfenster für den Hub"""
+    def __init__(self):
+        super().__init__()
+        self._init_shared(is_standalone=False)
+        self.after(200, lambda: self.focus())
 
 
 def run_app():

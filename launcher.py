@@ -219,5 +219,7 @@ class ToolHub(ctk.CTk):
         sys.exit(0)
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     app = ToolHub()
     app.mainloop()

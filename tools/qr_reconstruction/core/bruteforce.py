@@ -4,82 +4,113 @@ Intelligente Suche nach gültigen QR-Codes durch systematisches Ausprobieren
 Maximale Performance durch Multiprocessing (nutzt alle CPU-Cores)
 """
 
-import numpy as np
+import logging
+import multiprocessing
 import os
-from typing import List, Tuple, Callable, Optional, Dict, Any
-from itertools import product
+import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
-from .qr_matrix import QRMatrix, CellState
+from typing import List, Tuple, Callable, Optional, Dict
+
+import numpy as np
+
+from .qr_matrix import QRMatrix
 from .validator import QRValidator, ValidationResult
 
+logger = logging.getLogger(__name__)
 
-def _worker_process(matrix_grid: np.ndarray, 
-                   unknown_cells: List[Tuple[int, int]], 
-                   validator_weights: Dict,
-                   debug_mode: bool,
-                   chunk_candidates: List[Tuple[int, ...]]) -> List[ValidationResult]:
+# Unterhalb dieser Kandidatenzahl lohnt sich der Start eines Prozess-Pools nicht
+PARALLEL_THRESHOLD = 1024
+# Wie oft Worker Stop-Signal und Deadline prüfen (in Kandidaten)
+CHECK_INTERVAL = 32
+
+
+class CandidateSpace:
     """
-    Worker-Funktion für einen separaten Prozess.
-    Muss Top-Level sein, damit Pickle funktioniert.
-    
-    Args:
-        matrix_grid: Das Basis-Grid (numpy array)
-        unknown_cells: Liste der unbekannten Koordinaten
-        validator_weights: Konfiguration des Validators
-        debug_mode: Debug-Flag
-        chunk_candidates: Liste von Kandidaten (Tuples) die dieser Worker testen soll
-        
-    Returns:
-        Liste der gefundenen validen Ergebnisse
+    Bildet Kandidaten-Indizes [0, count) ohne Duplikate auf Belegungen der unbekannten Zellen ab.
+
+    - Vollständige Suche (count == 2^n): Index = Belegung
+    - Teilsuche: affine Bijektion v = (i * mult + offset) mod 2^n mit ungeradem mult,
+      damit die Stichprobe über den ganzen Suchraum streut statt nur die letzten Bits zu variieren.
+
+    Es wird nie eine Kandidatenliste im Speicher gehalten; Worker erzeugen ihre Belegungen selbst.
     """
-    # Konstruiere Validator im Worker (vermeidet Pickle-Probleme von pyzbar Objekten)
+
+    def __init__(self, num_unknown: int, count: int, seed: int):
+        self.num_unknown = num_unknown
+        self.total = 1 << num_unknown
+        self.count = min(count, self.total)
+        self._nbytes = max(1, (num_unknown + 7) // 8)
+        if self.count >= self.total:
+            self.mult, self.offset = 1, 0
+        else:
+            rng = random.Random(seed)
+            self.mult = rng.getrandbits(num_unknown) | 1
+            self.offset = rng.getrandbits(num_unknown)
+
+    def bits(self, index: int) -> np.ndarray:
+        """Belegung (0/1 je unbekannter Zelle) für einen Kandidaten-Index"""
+        value = (index * self.mult + self.offset) & (self.total - 1)
+        raw = np.frombuffer(value.to_bytes(self._nbytes, 'little'), dtype=np.uint8)
+        return np.unpackbits(raw, bitorder='little')[:self.num_unknown]
+
+
+class _CandidateTester:
+    """Testet Kandidaten gegen eine feste Basis-Matrix (wird pro Prozess genau einmal gebaut)"""
+
+    def __init__(self, base_grid: np.ndarray, unknown_cells: List[Tuple[int, int]],
+                 space: CandidateSpace, validator: QRValidator):
+        self.space = space
+        self.validator = validator
+        self.rows = np.array([r for r, _ in unknown_cells], dtype=np.intp)
+        self.cols = np.array([c for _, c in unknown_cells], dtype=np.intp)
+        self.matrix = QRMatrix(size=base_grid.shape[0])
+        self.matrix.grid = base_grid.copy()
+
+    def test(self, index: int) -> ValidationResult:
+        # CellState.BLACK == 1, CellState.WHITE == 0 → Bits direkt übernehmen
+        self.matrix.grid[self.rows, self.cols] = self.space.bits(index)
+        result = self.validator.validate(self.matrix)
+        if result.is_valid:
+            # Kopie, da das Grid für den nächsten Kandidaten überschrieben wird
+            result.matrix = self.matrix.grid.copy()
+        return result
+
+
+# Zustand pro Worker-Prozess (gesetzt durch _init_worker)
+_worker_tester: Optional[_CandidateTester] = None
+_worker_stop_event = None
+_worker_deadline: float = 0.0
+
+
+def _init_worker(base_grid, unknown_cells, space, validator_weights, debug_mode, stop_event, deadline):
+    """Initializer: baut Validator (inkl. Wörterbücher) nur einmal pro Prozess"""
+    global _worker_tester, _worker_stop_event, _worker_deadline
     validator = QRValidator(debug_mode=debug_mode)
     validator.WEIGHTS = validator_weights
-    
-    # Pre-allocate Matrix Object to reuse (Performance!)
-    # Wir erstellen einmal eine QRMatrix und manipulieren nur das Grid
-    # Da QRMatrix __init__ Logik hat, bauen wir es manuell oder nutzen eine Helper-Klasse
-    # Einfacher: Wir nutzen direkt die Validator-Funktionen die Arrays akzeptieren wenn möglich
-    # Aber `validate` erwartet QRMatrix.
-    
-    # Wir erstellen EINE Dummy-Matrix und updaten sie
-    size = matrix_grid.shape[0]
-    temp_matrix = QRMatrix(size=size)
-    
-    # Kopiere Basis-Grid
-    # Wir nutzen eine optimierte validation loop
+    _worker_tester = _CandidateTester(base_grid, unknown_cells, space, validator)
+    _worker_stop_event = stop_event
+    _worker_deadline = deadline
+
+
+def _worker_process(start: int, end: int) -> Tuple[int, List[ValidationResult]]:
+    """
+    Testet die Kandidaten-Indizes [start, end).
+    Muss Top-Level sein, damit Pickle funktioniert.
+
+    Returns:
+        (Anzahl tatsächlich getesteter Kandidaten, gültige Ergebnisse)
+    """
     results = []
-    
-    # Optimierung: Indices vorbereiten
-    rows = np.array([r for r, c in unknown_cells])
-    cols = np.array([c for r, c in unknown_cells])
-    
-    # Grid Buffer zum Wiederverwenden
-    work_grid = matrix_grid.copy()
-    
-    for combination in chunk_candidates:
-        # 1. Update Grid (Vektorisiert)
-        # work_grid[rows, cols] = combination # Geht nicht direkt so einfach mit Tupel
-        # Schnellster Weg in Python loop:
-        for i, val in enumerate(combination):
-            work_grid[rows[i], cols[i]] = CellState.BLACK if val == 1 else CellState.WHITE
-            
-        # 2. Update Matrix Objekt
-        temp_matrix.grid = work_grid # Reference is ok because we validate immediately
-        
-        # 3. Validiere
-        # Hier nutzen wir eine optimierte interne Funktion des Validators wenn möglich?
-        # Nein, wir rufen die normale validate auf, aber der Validator selbst wird gleich optimiert.
-        result = validator.validate(temp_matrix)
-        
+    tested = 0
+    for index in range(start, end):
+        if tested % CHECK_INTERVAL == 0 and (_worker_stop_event.is_set() or time.time() > _worker_deadline):
+            break
+        result = _worker_tester.test(index)
+        tested += 1
         if result.is_valid:
-            # WICHTIG: Tiefenkopie des Grids für das Ergebnis, sonst überschreiben wir es
-            result.matrix = work_grid.copy()  
             results.append(result)
-            
-    return results
+    return tested, results
 
 
 class BruteforceMode:
@@ -88,23 +119,20 @@ class BruteforceMode:
         'name': 'Schnell',
         'max_iterations': 1000,
         'max_time': 10,
-        'use_smart_sampling': True,
         'parallel': True
     }
-    
+
     ACCURATE = {
         'name': 'Akkurat',
         'max_iterations': 100000,
         'max_time': 300,
-        'use_smart_sampling': True,
         'parallel': True
     }
-    
+
     CUSTOM = {
         'name': 'Custom',
-        'max_iterations': None,
-        'max_time': None,
-        'use_smart_sampling': True,
+        'max_iterations': 10000,
+        'max_time': 60,
         'parallel': True
     }
 
@@ -114,12 +142,12 @@ class BruteforceEngine:
     High-Performance Bruteforce Engine
     Nutzt ProcessPoolExecutor für maximale CPU-Auslastung (Bypass GIL)
     """
-    
+
     def __init__(self, matrix: QRMatrix, validator: QRValidator):
         self.matrix = matrix
         self.validator = validator
         self.unknown_cells = matrix.get_unknown_cells()
-        
+
         self.stats = {
             'tested': 0,
             'valid': 0,
@@ -127,25 +155,42 @@ class BruteforceEngine:
             'end_time': None,
             'mode': None
         }
-        
+
         self.progress_callback: Optional[Callable] = None
         self.result_callback: Optional[Callable] = None
         self._should_stop = False
-        self._executor = None
-    
+        self._stop_event = None
+        # Beste Lösung je dekodiertem Text (pyzbar korrigiert intern Fehler,
+        # daher liefern viele Kandidaten denselben Inhalt)
+        self._results_by_data: Dict[str, ValidationResult] = {}
+
     def stop(self):
         self._should_stop = True
-        if self._executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-    
+        stop_event = self._stop_event  # lokal: der Bruteforce-Thread setzt das Attribut am Ende zurück
+        if stop_event is not None:
+            stop_event.set()
+
     def set_progress_callback(self, callback):
         self.progress_callback = callback
-    
+
     def set_result_callback(self, callback):
         self.result_callback = callback
-    
-    def run(self, mode='fast', max_iterations=None, max_time=None, parallel=True) -> List[ValidationResult]:
+
+    def run(self, mode='fast', max_iterations=None, max_time=None, parallel=True,
+            seed: Optional[int] = None) -> List[ValidationResult]:
+        """
+        Startet die Suche.
+
+        Args:
+            mode: 'fast', 'accurate' oder 'custom' (liefert die Standardwerte)
+            max_iterations / max_time: überschreiben die Standardwerte des Modus, falls gesetzt
+            seed: Seed für die Stichprobe bei Teilsuche (reproduzierbare Läufe)
+
+        Returns:
+            Gültige Ergebnisse, ein Eintrag pro dekodiertem Inhalt, nach Confidence sortiert
+        """
         self._should_stop = False
+        self._results_by_data = {}
         self.stats = {
             'tested': 0,
             'valid': 0,
@@ -153,169 +198,121 @@ class BruteforceEngine:
             'end_time': None,
             'mode': mode
         }
-        
-        if mode == 'fast': config = BruteforceMode.FAST.copy()
-        elif mode == 'accurate': config = BruteforceMode.ACCURATE.copy()
+
+        if mode == 'fast':
+            config = BruteforceMode.FAST.copy()
+        elif mode == 'accurate':
+            config = BruteforceMode.ACCURATE.copy()
         else:
             config = BruteforceMode.CUSTOM.copy()
-            config['max_iterations'] = max_iterations or 10000
-            config['max_time'] = max_time or 60
-            
+        if max_iterations is not None:
+            config['max_iterations'] = max_iterations
+        if max_time is not None:
+            config['max_time'] = max_time
+
         num_unknown = len(self.unknown_cells)
-        max_possible = 2 ** num_unknown
-        max_iter = min(config['max_iterations'], max_possible)
-        
-        # CPU Info
+        if seed is None:
+            seed = random.randrange(1 << 32)
+        space = CandidateSpace(num_unknown, config['max_iterations'], seed)
+        deadline = self.stats['start_time'] + config['max_time']
+
         cpu_count = os.cpu_count() or 4
-        print(f"\n{'='*60}")
-        print(f"🚀 High-Performance Bruteforce ({config['name']})")
-        print(f"   CPU: {cpu_count} Kerne erkannt")
-        print(f"   Ziel: {max_iter:,} Tests")
-        print(f"{'='*60}")
-        
-        results = []
-        if parallel and num_unknown > 10:
-            results = self._run_multiprocess(max_iter, config['max_time'], cpu_count)
+        logger.info("Bruteforce (%s): %d unbekannte Zellen, %s von 2^%d Kandidaten, %d CPU-Kerne",
+                    config['name'], num_unknown, f"{space.count:,}", num_unknown, cpu_count)
+
+        if parallel and space.count > PARALLEL_THRESHOLD:
+            self._run_multiprocess(space, deadline, cpu_count)
         else:
-            results = self._run_sequential(max_iter, config['max_time'])
-            
+            self._run_sequential(space, deadline)
+
         self.stats['end_time'] = time.time()
         elapsed = self.stats['end_time'] - self.stats['start_time']
-        
-        print(f"\n{'='*60}")
-        print(f"Fertig! {self.stats['tested']:,} Tests in {elapsed:.2f}s")
-        print(f"Geschwindigkeit: {self.stats['tested'] / elapsed:.0f} Tests/s")
-        print(f"{'='*60}\n")
-        
+        logger.info("Fertig: %s Tests in %.2fs (%.0f Tests/s), %d eindeutige Ergebnisse",
+                    f"{self.stats['tested']:,}", elapsed,
+                    self.stats['tested'] / elapsed if elapsed > 0 else 0, self.stats['valid'])
+
+        results = list(self._results_by_data.values())
         results.sort(key=lambda x: x.confidence, reverse=True)
         return results
 
-    def _run_sequential(self, max_iterations, max_time):
-        # Fallback für sehr kleine Aufgaben
-        results = []
-        start = time.time()
-        
-        # Eigene Matrix-Instanz wiederverwenden um Overhead zu sparen
-        temp_matrix = self.matrix.clone()
-        rows = [r for r, c in self.unknown_cells]
-        cols = [c for r, c in self.unknown_cells]
-        
-        for i, combination in enumerate(self._generate_candidates(max_iterations)):
-            if self._should_stop or (time.time() - start > max_time): break
-            
-            # Apply
-            for idx, val in enumerate(combination):
-                temp_matrix.grid[rows[idx], cols[idx]] = CellState.BLACK if val == 1 else CellState.WHITE
-                
-            # Validate
-            result = self.validator.validate(temp_matrix)
+    def _collect(self, result: ValidationResult):
+        """Übernimmt ein gültiges Ergebnis; pro dekodiertem Inhalt bleibt das beste"""
+        key = result.decoded_data
+        existing = self._results_by_data.get(key)
+        if existing is None:
+            self._results_by_data[key] = result
+            self.stats['valid'] += 1
+            if self.result_callback:
+                self.result_callback(result)
+        elif result.confidence > existing.confidence:
+            self._results_by_data[key] = result
+
+    def _report_progress(self, total):
+        if self.progress_callback:
+            self.progress_callback(self.stats['tested'], self.stats['valid'], total)
+
+    def _run_sequential(self, space: CandidateSpace, deadline: float):
+        # Für kleine Aufgaben: kein Prozess-Overhead, eigener Validator wird wiederverwendet
+        tester = _CandidateTester(self.matrix.grid, self.unknown_cells, space, self.validator)
+
+        for index in range(space.count):
+            if self._should_stop or time.time() > deadline:
+                break
+            result = tester.test(index)
             self.stats['tested'] += 1
-            
             if result.is_valid:
-                # IMPORTANT: Deep copy matrix for result
-                result.matrix = temp_matrix.grid.copy()
-                results.append(result)
-                self.stats['valid'] += 1
-                if self.result_callback: self.result_callback(result)
-            
-            if i % 100 == 0 and self.progress_callback:
-                self.progress_callback(self.stats['tested'], self.stats['valid'], max_iterations)
-                
-        return results
+                self._collect(result)
+            if index % 100 == 0:
+                self._report_progress(space.count)
 
-    def _run_multiprocess(self, max_iterations, max_time, workers):
-        results = []
-        start = time.time()
-        
-        # Generator konsumieren und in Chunks aufteilen
-        # Da wir Multiprocessing machen, müssen wir Batches an die Worker schicken
-        # um den Overhead der Inter-Process-Communication (IPC) gering zu halten.
-        all_candidates = list(self._generate_candidates(max_iterations))
-        total_candidates = len(all_candidates)
-        
-        # Batch Size berechnen (mindestens 100 pro Chunk, oder alles durch 4x Worker)
-        chunk_size = max(100, total_candidates // (workers * 4))
-        chunks = [all_candidates[i:i + chunk_size] for i in range(0, total_candidates, chunk_size)]
-        
-        print(f"   Verteile {total_candidates} Aufgaben auf {workers} Worker in {len(chunks)} Batches...")
-        
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            self._executor = executor
-            futures = []
-            
-            # Submit all chunks
-            for chunk in chunks:
-                if self._should_stop: break
-                
-                # Wir übergeben rohe Daten, keine komplexen Objekte um Pickle-Overhead zu minimieren
-                future = executor.submit(
-                    _worker_process,
-                    self.matrix.grid,
-                    self.unknown_cells,
-                    self.validator.WEIGHTS,
-                    self.validator.debug_mode,
-                    chunk
-                )
-                futures.append(future)
-            
-            # Process results as they come in
-            completed_count = 0
-            for future in as_completed(futures):
-                if self._should_stop: 
-                    self._executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                
-                if time.time() - start > max_time:
-                    self._executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                
-                try:
-                    chunk_results = future.result()
-                    
-                    # Update Stats
-                    chunk_len = 0 
-                    # Wir wissen nicht exakt wie viele processed wurden im Chunk wenn wir es nicht zurückgeben
-                    # Aber wir nehmen an alle im Chunk wurden processed.
-                    # Workaround: Wir zählen einfach completed chunks * chunk_size (ungefähr)
-                    # Bessere Lösung: Worker gibt (tested_count, results) zurück.
-                    # Aber wir lassen es simpel.
-                    
-                    # Add results
+        self._report_progress(space.count)
+
+    def _run_multiprocess(self, space: CandidateSpace, deadline: float, workers: int):
+        # Batches, damit der IPC-Overhead klein bleibt, aber Fortschritt regelmäßig kommt
+        chunk_size = max(50, min(2000, space.count // (workers * 8)))
+        ranges = [(start, min(start + chunk_size, space.count))
+                  for start in range(0, space.count, chunk_size)]
+
+        ctx = multiprocessing.get_context()
+        self._stop_event = ctx.Event()
+        if self._should_stop:
+            self._stop_event.set()
+
+        logger.info("Verteile %s Kandidaten auf %d Worker in %d Batches",
+                    f"{space.count:,}", workers, len(ranges))
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(self.matrix.grid, self.unknown_cells, space, self.validator.WEIGHTS,
+                          self.validator.debug_mode, self._stop_event, deadline),
+            ) as executor:
+                futures = [executor.submit(_worker_process, start, end) for start, end in ranges]
+
+                pending_cancelled = False
+                for future in as_completed(futures):
+                    if not pending_cancelled and (self._should_stop or time.time() > deadline):
+                        # Noch nicht gestartete Batches verwerfen; laufende beenden sich
+                        # selbst über Stop-Event bzw. Deadline
+                        for f in futures:
+                            f.cancel()
+                        pending_cancelled = True
+                    if future.cancelled():
+                        continue
+                    try:
+                        tested, chunk_results = future.result()
+                    except Exception:
+                        logger.exception("Worker-Fehler")
+                        continue
+
+                    self.stats['tested'] += tested
                     for res in chunk_results:
-                        results.append(res)
-                        self.stats['valid'] += 1
-                        if self.result_callback: self.result_callback(res)
-                    
-                    completed_count += 1
-                    self.stats['tested'] = min(total_candidates, completed_count * chunk_size)
-                    
-                    if self.progress_callback:
-                        self.progress_callback(self.stats['tested'], self.stats['valid'], max_iterations)
-                        
-                except Exception as e:
-                    print(f"Worker Error: {e}")
-
-        return results
-
-    def _generate_candidates(self, max_count):
-        # ... (Gleiche Logik wie vorher) ...
-        num_unknown = len(self.unknown_cells)
-        if num_unknown <= 20:
-            for i, combo in enumerate(product([0, 1], repeat=num_unknown)):
-                if i >= max_count: break
-                yield combo
-        else:
-            # Smart Sampling
-            count = 0
-            # 1. 50/50
-            for _ in range(min(max_count // 3, 1000)):
-                yield tuple(np.random.choice([0, 1], size=num_unknown, p=[0.5, 0.5]))
-                count += 1
-            
-            # 2. Random
-            remaining = max_count - count
-            for _ in range(remaining):
-                yield tuple(np.random.randint(0, 2, size=num_unknown))
+                        self._collect(res)
+                    self._report_progress(space.count)
+        finally:
+            self._stop_event = None
 
     def get_stats(self) -> Dict:
         """Gibt aktuelle Statistiken zurück"""

@@ -9,6 +9,7 @@ Validiert QR-Codes basierend auf:
 - Inhalt (URL-Patterns, Wörterbuch-Matches) [NEU]
 """
 
+import logging
 import numpy as np
 from typing import Optional, Tuple
 from dataclasses import dataclass
@@ -16,6 +17,13 @@ from PIL import Image
 import os
 from .qr_matrix import QRMatrix, CellState
 from .content_scorer import ContentScorer, ContentScore, get_content_scorer
+
+logger = logging.getLogger(__name__)
+
+# Upscaling-Faktor fürs Dekodieren: zbar erkennt bei 4 genauso zuverlässig wie bei 20, ist aber ~8x schneller
+DECODE_SCALE = 4
+# Spezifikationskonformer weißer Rand (Quiet Zone) in Modulen
+QUIET_ZONE = 4
 
 
 @dataclass
@@ -87,11 +95,10 @@ class QRValidator:
             import pyzbar.pyzbar as pyzbar
             self.pyzbar = pyzbar
             self.pyzbar_available = True
-            print("✓ pyzbar erfolgreich geladen")
+            logger.debug("pyzbar erfolgreich geladen")
         except ImportError:
-            print("⚠️ pyzbar nicht installiert - Dekodierung eingeschränkt")
-            print("   Installation: pip install pyzbar")
-            print("   Windows: Zusätzlich zbar DLL benötigt!")
+            logger.warning("pyzbar nicht installiert - Dekodierung nicht möglich. "
+                           "Installation: pip install pyzbar (Windows: zusätzlich zbar DLL)")
     
     def validate(self, matrix: QRMatrix) -> ValidationResult:
         """Validiert eine QR-Matrix und berechnet Confidence"""
@@ -110,10 +117,9 @@ class QRValidator:
         density_score = self._check_density(binary)
         debug_info.append(f"Density: {density_score*100:.1f}%")
 
-        # PERFORMANCE OPTIMIZATION:
-        # Wenn die Struktur zu schlecht ist (z.B. < 50%), brechen wir sofort ab.
-        # Das spart extrem viel Zeit bei der Bruteforce-Suche, da wir uns
-        # das teure Dekodieren sparen.
+        # PERFORMANCE: Early-Abort vor dem teuren Dekodieren, wenn Finder/Timing kaputt sind.
+        # Hinweis: Eine Vorab-Prüfung der Format-Info ist NICHT sicher - zbar liest Codes auch dann
+        # noch, wenn beide Kopien mehr Bitfehler haben als BCH(15,5) korrigieren kann.
         if structure_score < 0.5:
              return ValidationResult(
                 is_valid=False,
@@ -307,7 +313,10 @@ class QRValidator:
     
     def _try_decode(self, grid: np.ndarray) -> Tuple[Optional[str], float, str]:
         """
-        Versucht den QR-Code zu dekodieren (mit mehreren Strategien)
+        Versucht den QR-Code zu dekodieren
+        
+        Ein Versuch genügt: Die Polarität ist durch die festen (schwarzen) Finder-Patterns
+        vorgegeben, und größere Skalierung erhöht die Trefferquote bei zbar nicht.
         
         Returns:
             (decoded_data, score, debug_info)
@@ -315,83 +324,36 @@ class QRValidator:
         if not self.pyzbar_available:
             return None, 0.0, "pyzbar nicht verfügbar"
         
-        debug_info = []
-        
-        try:
-            # Strategie 1: Standard-Dekodierung
-            result = self._decode_attempt(grid, invert=False, scale=20)
-            if result:
-                debug_info.append(f"✓ Dekodiert: {result[:30]}...")
-                return result, 1.0, " | ".join(debug_info)
-            
-            # Strategie 2: Invertiert
-            result = self._decode_attempt(grid, invert=True, scale=20)
-            if result:
-                debug_info.append(f"✓ Invertiert: {result[:30]}...")
-                return result, 1.0, " | ".join(debug_info)
-            
-            # Strategie 3: Größere Skalierung
-            result = self._decode_attempt(grid, invert=False, scale=30)
-            if result:
-                debug_info.append(f"✓ Groß: {result[:30]}...")
-                return result, 1.0, " | ".join(debug_info)
-            
-            # Strategie 4: Invertiert + groß
-            result = self._decode_attempt(grid, invert=True, scale=30)
-            if result:
-                debug_info.append(f"✓ Inv+Groß: {result[:30]}...")
-                return result, 1.0, " | ".join(debug_info)
-            
-            debug_info.append("✗ Dekodierung fehlgeschlagen")
-            return None, 0.0, " | ".join(debug_info)
-        
-        except Exception as e:
-            debug_info.append(f"✗ Fehler: {str(e)}")
-            return None, 0.0, " | ".join(debug_info)
+        result = self._decode_attempt(grid)
+        if result is not None:
+            return result, 1.0, f"✓ Dekodiert: {result[:30]}..."
+        return None, 0.0, "✗ Dekodierung fehlgeschlagen"
     
-    def _decode_attempt(self, grid: np.ndarray, invert: bool, scale: int) -> Optional[str]:
-        """Ein Dekodierungs-Versuch mit optimierter NumPy-Performance"""
+    def _decode_attempt(self, grid: np.ndarray, scale: int = DECODE_SCALE) -> Optional[str]:
+        """Ein Dekodierungs-Versuch (0/1-Grid, 1 = schwarz)"""
         try:
-            # 1. Konvertiere zu uint8 (0 oder 255)
-            # Invertierung direkt im Numpy Array
-            if invert:
-                # grid ist 0/1 -> invertiert: 1/0 -> * 255
-                img_array = (grid * 255).astype(np.uint8)
-            else:
-                # grid ist 0/1 -> normal: 0(weiß)/1(schwarz). 
-                # QR Code Standard: 0=White, 1=Black. 
-                # Pyzbar/Images erwarten oft: 0=Black, 255=White (Luminance)
-                # Halt, QR Matrix: 0=White, 1=Black (in Core Logic)
-                # Bild: 255=White, 0=Black.
-                # Also: 0 -> 255, 1 -> 0.
-                # Formel: (1 - grid) * 255
-                img_array = ((1 - grid) * 255).astype(np.uint8)
+            # QR-Matrix: 1 = schwarz, Bild: 0 = schwarz / 255 = weiß
+            img_array = ((1 - grid) * 255).astype(np.uint8)
+            img_array = np.pad(img_array, QUIET_ZONE, constant_values=255)
             
-            # 2. Schnelles Upscaling mit Numpy (statt PIL.resize)
-            # repeat() ist extrem effizient für Nearest-Neighbor Integer-Scaling
+            # Nearest-Neighbor-Upscaling direkt in NumPy
             if scale > 1:
                 img_array = img_array.repeat(scale, axis=0).repeat(scale, axis=1)
             
-            # Debug: Speichere Bild (nur wenn nötig PIL importieren/nutzen)
             if self.debug_mode:
-                debug_filename = f'debug_qr_images/qr_decode_{self.debug_counter}_{("inv" if invert else "std")}_s{scale}.png'
+                debug_filename = f'debug_qr_images/qr_decode_{self.debug_counter}_s{scale}.png'
                 try:
                     Image.fromarray(img_array).save(debug_filename)
-                except Exception:
-                    pass
+                except OSError as e:
+                    logger.debug("Debug-Bild konnte nicht gespeichert werden: %s", e)
             
-            # 3. Direktes Dekodieren des Numpy Arrays (spart PIL Konvertierung)
             decoded = self.pyzbar.decode(img_array)
-            
-            if decoded and len(decoded) > 0:
-                data = decoded[0].data.decode('utf-8', errors='ignore')
-                return data
-            
+            if decoded:
+                return decoded[0].data.decode('utf-8', errors='ignore')
             return None
         
         except Exception as e:
-            if self.debug_mode:
-                print(f"  ✗ Dekodierungs-Fehler: {e}")
+            logger.debug("Dekodierungs-Fehler: %s", e)
             return None
         finally:
             self.debug_counter += 1
