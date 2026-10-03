@@ -6,6 +6,7 @@ from .qr_matrix import QRMatrix, CellState
 from .bruteforce import BruteforceEngine, BruteforceMode
 from .validator import QRValidator, ValidationResult
 from .content_scorer import ContentScorer, ContentScore, get_content_scorer
+from .reconstructor import Reconstructor
 
 __all__ = [
     'QRMatrix',
@@ -16,5 +17,6 @@ __all__ = [
     'ValidationResult',
     'ContentScorer',
     'ContentScore',
-    'get_content_scorer'
+    'get_content_scorer',
+    'Reconstructor',
 ]

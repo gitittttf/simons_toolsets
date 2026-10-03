@@ -8,11 +8,14 @@ basierend auf:
 - Text-Lesbarkeit
 """
 
+import logging
 import re
 import os
 from dataclasses import dataclass
 from typing import List, Set, Tuple, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,7 +80,8 @@ class ContentScorer:
     WEIGHT_URL = 0.40
     WEIGHT_DICTIONARY = 0.40
     WEIGHT_READABILITY = 0.20
-    
+    FULL_URL_BONUS = 0.30
+
     def __init__(self, dictionaries_path: Optional[str] = None):
         """
         Initialisiert den ContentScorer
@@ -117,11 +121,11 @@ class ContentScorer:
                         for line in f 
                         if line.strip() and len(line.strip()) >= 3
                     }
-                print(f"✓ Deutsches Wörterbuch geladen: {len(self.german_words):,} Wörter")
+                logger.debug("Deutsches Wörterbuch geladen: %d Wörter", len(self.german_words))
             except Exception as e:
-                print(f"⚠️ Fehler beim Laden des deutschen Wörterbuchs: {e}")
+                logger.warning("Fehler beim Laden des deutschen Wörterbuchs: %s", e)
         else:
-            print(f"⚠️ Deutsches Wörterbuch nicht gefunden: {german_file}")
+            logger.warning("Deutsches Wörterbuch nicht gefunden: %s", german_file)
             # Fallback: Einige häufige deutsche Wörter
             self.german_words = self._get_fallback_german_words()
         
@@ -134,11 +138,11 @@ class ContentScorer:
                         for line in f 
                         if line.strip() and len(line.strip()) >= 3
                     }
-                print(f"✓ Englisches Wörterbuch geladen: {len(self.english_words):,} Wörter")
+                logger.debug("Englisches Wörterbuch geladen: %d Wörter", len(self.english_words))
             except Exception as e:
-                print(f"⚠️ Fehler beim Laden des englischen Wörterbuchs: {e}")
+                logger.warning("Fehler beim Laden des englischen Wörterbuchs: %s", e)
         else:
-            print(f"⚠️ Englisches Wörterbuch nicht gefunden: {english_file}")
+            logger.warning("Englisches Wörterbuch nicht gefunden: %s", english_file)
             # Fallback: Einige häufige englische Wörter
             self.english_words = self._get_fallback_english_words()
     
@@ -228,10 +232,10 @@ class ContentScorer:
         
         # Boost für vollständige URLs
         if self.FULL_URL_REGEX.match(text):
-            # USER-REQUEST: Wenn es eine volle URL ist, dann ist der Content perfekt.
-            # Ignoriere Wörterbuch-Checks.
-            total_score = 1.0
-            debug_parts.append("(Vollständige URL = 100%)")
+            # Vollständige URL: kräftiger Bonus, aber kein fixes 100% - sonst wären bei mehrdeutigen
+            # Rekonstruktionen alle URL-Varianten gleich gut und das Wörterbuch könnte nicht mehr ranken
+            total_score += self.FULL_URL_BONUS
+            debug_parts.append(f"(Vollständige URL +{self.FULL_URL_BONUS:.0%})")
         
         return ContentScore(
             total_score=min(1.0, total_score),
