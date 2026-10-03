@@ -32,8 +32,8 @@ class QRReconstructionTool(BaseTool):
     def cleanup(self):
         """Stoppt Hintergrund-Prozesse"""
         if hasattr(self, 'window') and self.window:
-            if hasattr(self.window, 'bruteforce_engine') and self.window.bruteforce_engine:
-                self.window.bruteforce_engine.stop()
+            if getattr(self.window, 'active_job', None):
+                self.window.active_job.stop()
             try:
                 self.window.destroy()
             except Exception as e:

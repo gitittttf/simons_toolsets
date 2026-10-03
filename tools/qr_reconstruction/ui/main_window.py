@@ -17,6 +17,7 @@ from .grid_editor import GridEditor
 from .results_view import ResultsView
 from ..core.qr_matrix import QRMatrix, QR_VERSIONS, get_version_for_size
 from ..core.bruteforce import BruteforceEngine
+from ..core.reconstructor import Reconstructor
 from ..core.validator import QRValidator
 
 
@@ -45,7 +46,8 @@ class MainWindowMixin:
         # State
         self.matrix: Optional[QRMatrix] = None
         self.validator = QRValidator()
-        self.bruteforce_engine: Optional[BruteforceEngine] = None
+        # Laufender Job: Reconstructor oder (als Fallback) BruteforceEngine
+        self.active_job = None
         self.bruteforce_thread: Optional[threading.Thread] = None
         self.is_running = False
 
@@ -58,8 +60,8 @@ class MainWindowMixin:
 
     def _on_close(self):
         """Clean exit handler"""
-        if self.is_running and self.bruteforce_engine:
-            self.bruteforce_engine.stop()
+        if self.is_running and self.active_job:
+            self.active_job.stop()
         
         # If standalone, we destroy ourselves (and exit app)
         if self.is_standalone:
@@ -503,17 +505,13 @@ class MainWindowMixin:
             self.quick_stats.configure(text=f"📊 Version {stats['version']}  •  {stats['unknown_cells']} Unbekannte Zellen")
             
     def _start_bruteforce(self):
-        """Bruteforce starten"""
+        """Rekonstruktion starten: erst Reed-Solomon, Pixel-Bruteforce nur als Fallback"""
         stats = self.matrix.get_stats()
         unknown = stats['unknown_cells']
         
         if unknown == 0:
             messagebox.showinfo("Info", "Alle Pixel sind bereits bekannt!", parent=self)
             return
-            
-        if unknown > 30:
-            if not messagebox.askyesno("Warnung", f"{unknown} unbekannte Pixel = Extrem viele Kombinationen!\nFortfahren?", parent=self):
-                return
         
         if hasattr(self, 'btn_start'):
             self.btn_start.configure(state="disabled", text="⏳ Arbeite...")
@@ -549,26 +547,48 @@ class MainWindowMixin:
             max_iter = 50000
             max_time = 120
         
+        self._run_settings = (mode, max_iter, max_time)
         self.is_running = True
-        engine = BruteforceEngine(self.matrix, self.validator)
-        self.bruteforce_engine = engine
+        job = Reconstructor(self.matrix, self.validator)
+        self._start_job(job, lambda: job.run(max_time=max_time), "rs_complete")
+
+    def _start_job(self, job, run_job, complete_message):
+        """Startet einen Job (Reconstructor/BruteforceEngine) in einem Hintergrund-Thread"""
+        self.active_job = job
 
         # Worker-Thread kommuniziert nur über seine eigene Queue mit der UI.
         # Lokale Variable statt self.msg_queue, damit ein alter Lauf nie in die Queue eines neuen schreibt.
         msg_queue = queue.Queue()
         self.msg_queue = msg_queue
 
-        engine.set_progress_callback(lambda tested, valid, total: msg_queue.put(("progress", (tested, valid, total))))
-        engine.set_result_callback(lambda result: msg_queue.put(("result", result)))
+        job.set_progress_callback(lambda tested, valid, total: msg_queue.put(("progress", (tested, valid, total))))
+        job.set_result_callback(lambda result: msg_queue.put(("result", result)))
 
         def run():
-            results = engine.run(mode=mode, max_iterations=max_iter, max_time=max_time, parallel=True)
-            msg_queue.put(("complete", results))
+            msg_queue.put((complete_message, run_job()))
 
         self.bruteforce_thread = threading.Thread(target=run, daemon=True)
         self.bruteforce_thread.start()
 
         self._check_queue(msg_queue)
+
+    def _start_fallback_bruteforce(self):
+        """Pixel-Bruteforce, wenn die RS-Rekonstruktion keine Lösung gefunden hat"""
+        mode, max_iter, max_time = self._run_settings
+        unknown = self.matrix.get_stats()['unknown_cells']
+        question = ("Die Reed-Solomon-Rekonstruktion hat keine Lösung gefunden.\n"
+                    f"Pixel-Bruteforce über {unknown} unbekannte Pixel versuchen?")
+        if unknown > 30:
+            question += f"\n\nAchtung: 2^{unknown} Kombinationen - nur eine Stichprobe ist machbar."
+        if not messagebox.askyesno("Keine Lösung", question, parent=self):
+            self._on_complete([])
+            return
+        engine = BruteforceEngine(self.matrix, self.validator)
+        self._start_job(
+            engine,
+            lambda: engine.run(mode=mode, max_iterations=max_iter, max_time=max_time, parallel=True),
+            "complete",
+        )
 
     def _check_queue(self, msg_queue):
         """Pollt die Queue des Worker-Threads (läuft im Tk-Main-Thread)"""
@@ -584,6 +604,13 @@ class MainWindowMixin:
                     self._update_progress_ui(*data)
                 elif m_type == "result":
                     self.results_view.add_result(data)
+                elif m_type == "rs_complete":
+                    # Fallback nur, wenn RS nichts fand und der Nutzer nicht abgebrochen hat
+                    if data or self.active_job.stop_requested:
+                        self._on_complete(data)
+                    else:
+                        self._start_fallback_bruteforce()
+                    return # Stop polling
                 elif m_type == "complete":
                     self._on_complete(data)
                     return # Stop polling
@@ -654,12 +681,17 @@ class MainWindowMixin:
         self.progress_bar.pack_forget()
         self.btn_stop.configure(state="normal", text="✓ Fertig", command=self._back, fg_color=Colors.SUCCESS, text_color="#ffffff", hover_color="#2e8b57")
         
-        stats = self.bruteforce_engine.get_stats()
-        messagebox.showinfo("Fertig", f"Tests: {stats['tested']:,}\nGültig: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s", parent=self)
+        stats = self.active_job.get_stats()
+        if stats.get('mode') == 'rs':
+            text = (f"Reed-Solomon-Rekonstruktion\nGeprüfte Formate: {stats['tested']}\n"
+                    f"Lösungen: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s")
+        else:
+            text = f"Tests: {stats['tested']:,}\nGültig: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s"
+        messagebox.showinfo("Fertig", text, parent=self)
     
     def _stop(self):
-        if self.bruteforce_engine:
-            self.bruteforce_engine.stop()
+        if self.active_job:
+            self.active_job.stop()
         self.btn_stop.configure(state="disabled", text="Gestoppt")
     
     def _back(self):

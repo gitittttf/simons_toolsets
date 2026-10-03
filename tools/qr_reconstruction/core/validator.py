@@ -47,7 +47,16 @@ class ValidationResult:
     url_type: Optional[str] = None
     german_words: int = 0
     english_words: int = 0
-    
+
+    # Herkunft: "bruteforce" (Pixel durchprobieren) oder "rs" (Reed-Solomon-Rekonstruktion)
+    method: str = "bruteforce"
+    mask_pattern: Optional[int] = None
+    unknown_codewords: int = 0   # Codewörter mit unbekannten Bits, die rekonstruiert wurden
+    corrected_errors: int = 0    # bekannte, aber falsch abgemalte Codewörter, die korrigiert wurden
+    ambiguous_bits: int = 0      # Freiheitsgrade: 0 = eindeutig, sonst 2^n mögliche Lösungen
+    padding_ok: bool = True      # Terminator/Padding entsprechen der Spezifikation
+    decoder_confirmed: bool = False  # pyzbar liest die rekonstruierte Matrix mit demselben Inhalt
+
     # Debug-Info
     debug_info: str = ""
     

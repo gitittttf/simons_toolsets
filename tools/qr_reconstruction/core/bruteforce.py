@@ -14,6 +14,7 @@ from typing import List, Tuple, Callable, Optional, Dict
 
 import numpy as np
 
+from .gil import GilYielder
 from .qr_matrix import QRMatrix
 from .validator import QRValidator, ValidationResult
 
@@ -170,6 +171,10 @@ class BruteforceEngine:
         if stop_event is not None:
             stop_event.set()
 
+    @property
+    def stop_requested(self) -> bool:
+        return self._should_stop
+
     def set_progress_callback(self, callback):
         self.progress_callback = callback
 
@@ -255,9 +260,11 @@ class BruteforceEngine:
         # Für kleine Aufgaben: kein Prozess-Overhead, eigener Validator wird wiederverwendet
         tester = _CandidateTester(self.matrix.grid, self.unknown_cells, space, self.validator)
 
+        yield_gil = GilYielder()
         for index in range(space.count):
             if self._should_stop or time.time() > deadline:
                 break
+            yield_gil()
             result = tester.test(index)
             self.stats['tested'] += 1
             if result.is_valid:

@@ -80,7 +80,8 @@ class ContentScorer:
     WEIGHT_URL = 0.40
     WEIGHT_DICTIONARY = 0.40
     WEIGHT_READABILITY = 0.20
-    
+    FULL_URL_BONUS = 0.30
+
     def __init__(self, dictionaries_path: Optional[str] = None):
         """
         Initialisiert den ContentScorer
@@ -231,10 +232,10 @@ class ContentScorer:
         
         # Boost für vollständige URLs
         if self.FULL_URL_REGEX.match(text):
-            # USER-REQUEST: Wenn es eine volle URL ist, dann ist der Content perfekt.
-            # Ignoriere Wörterbuch-Checks.
-            total_score = 1.0
-            debug_parts.append("(Vollständige URL = 100%)")
+            # Vollständige URL: kräftiger Bonus, aber kein fixes 100% - sonst wären bei mehrdeutigen
+            # Rekonstruktionen alle URL-Varianten gleich gut und das Wörterbuch könnte nicht mehr ranken
+            total_score += self.FULL_URL_BONUS
+            debug_parts.append(f"(Vollständige URL +{self.FULL_URL_BONUS:.0%})")
         
         return ContentScore(
             total_score=min(1.0, total_score),

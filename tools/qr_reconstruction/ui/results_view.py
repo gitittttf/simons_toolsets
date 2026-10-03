@@ -436,7 +436,12 @@ class ResultsView(ctk.CTkFrame):
         # Confidence
         conf_value = result.confidence / 100.0
         self.confidence_bar.set(conf_value)
-        self.confidence_label.configure(text=f"{result.confidence:.1f}%")
+        label = f"{result.confidence:.1f}%"
+        if result.method == "rs":
+            label += f"  ·  Reed-Solomon ({result.error_correction_level}, Maske {result.mask_pattern})"
+            if result.ambiguous_bits:
+                label += f"  ·  mehrdeutig (2^{result.ambiguous_bits})"
+        self.confidence_label.configure(text=label)
         
         # Farbe basierend auf Confidence
         if result.confidence >= 70:
