@@ -5,7 +5,7 @@ Validiert QR-Codes basierend auf:
 - Struktur (Finder-Patterns, Timing-Patterns)
 - Muster-Qualität
 - Modul-Dichte
-- Dekodierbarkeit (pyzbar)
+- Dekodierbarkeit (eigener Decoder, core/decoder.py - bewusst nicht pyzbar/zbar, siehe dort)
 - Inhalt (URL-Patterns, Wörterbuch-Matches) [NEU]
 """
 
@@ -13,17 +13,11 @@ import logging
 import numpy as np
 from typing import Optional, Tuple
 from dataclasses import dataclass
-from PIL import Image
-import os
-from .qr_matrix import QRMatrix, CellState
+from .qr_matrix import QRMatrix
 from .content_scorer import get_content_scorer
+from .decoder import decode_grid
 
 logger = logging.getLogger(__name__)
-
-# Upscaling-Faktor fürs Dekodieren: zbar erkennt bei 4 genauso zuverlässig wie bei 20, ist aber ~8x schneller
-DECODE_SCALE = 4
-# Spezifikationskonformer weißer Rand (Quiet Zone) in Modulen
-QUIET_ZONE = 4
 
 
 @dataclass
@@ -55,7 +49,7 @@ class ValidationResult:
     corrected_errors: int = 0    # bekannte, aber falsch abgemalte Codewörter, die korrigiert wurden
     ambiguous_bits: int = 0      # Freiheitsgrade: 0 = eindeutig, sonst 2^n mögliche Lösungen
     padding_ok: bool = True      # Terminator/Padding entsprechen der Spezifikation
-    decoder_confirmed: bool = False  # pyzbar liest die rekonstruierte Matrix mit demselben Inhalt
+    decoder_confirmed: bool = False  # das gerenderte Symbol wird unabhängig wieder mit demselben Inhalt gelesen
     assumption: str = ""         # Struktur-Annahme, unter der die Lösung eindeutig wurde
 
     # Debug-Info
@@ -88,27 +82,12 @@ class QRValidator:
         Initialisiert den Validator
         
         Args:
-            debug_mode: Wenn True, werden Debug-Bilder gespeichert
+            debug_mode: Wenn True, wird jeder Dekodierversuch protokolliert
         """
         self.debug_mode = debug_mode
-        self.pyzbar_available = False
-        self.debug_counter = 0
         
         # Content-Scorer initialisieren
         self.content_scorer = get_content_scorer()
-        
-        # Erstelle Debug-Ordner
-        if debug_mode:
-            os.makedirs('debug_qr_images', exist_ok=True)
-        
-        try:
-            import pyzbar.pyzbar as pyzbar
-            self.pyzbar = pyzbar
-            self.pyzbar_available = True
-            logger.debug("pyzbar erfolgreich geladen")
-        except ImportError:
-            logger.warning("pyzbar nicht installiert - Dekodierung nicht möglich. "
-                           "Installation: pip install pyzbar (Windows: zusätzlich zbar DLL)")
     
     def validate(self, matrix: QRMatrix) -> ValidationResult:
         """Validiert eine QR-Matrix und berechnet Confidence"""
@@ -213,93 +192,47 @@ class QRValidator:
         
         return score / checks if checks > 0 else 0.0
     
+    # 7×7 Finder-Pattern: schwarzer Rahmen, weißer Ring, schwarzes 3×3-Zentrum
+    _FINDER_TEMPLATE = np.ones((7, 7), dtype=int)
+    _FINDER_TEMPLATE[1:6, 1:6] = 0
+    _FINDER_TEMPLATE[2:5, 2:5] = 1
+
     def _validate_finder_pattern(self, grid: np.ndarray, row: int, col: int) -> bool:
         """Validiert ein einzelnes Finder-Pattern"""
-        try:
-            # Äußerer Rahmen muss schwarz sein
-            for i in range(7):
-                if grid[row + i, col] != CellState.BLACK or \
-                   grid[row + i, col + 6] != CellState.BLACK or \
-                   grid[row, col + i] != CellState.BLACK or \
-                   grid[row + 6, col + i] != CellState.BLACK:
-                    return False
-            
-            # Weißer innerer Rahmen
-            for i in range(1, 6):
-                for j in range(1, 6):
-                    if i == 1 or i == 5 or j == 1 or j == 5:
-                        if grid[row + i, col + j] != CellState.WHITE:
-                            return False
-            
-            # Schwarzes Zentrum
-            for i in range(2, 5):
-                for j in range(2, 5):
-                    if grid[row + i, col + j] != CellState.BLACK:
-                        return False
-            
-            return True
-        except IndexError:
-            return False
+        region = grid[row:row + 7, col:col + 7]
+        return region.shape == (7, 7) and bool((region == self._FINDER_TEMPLATE).all())
     
     def _validate_timing_patterns(self, grid: np.ndarray, size: int) -> bool:
-        """Validiert Timing-Patterns"""
-        try:
-            for i in range(8, size - 8):
-                expected = CellState.BLACK if (i % 2 == 0) else CellState.WHITE
-                if grid[6, i] != expected or grid[i, 6] != expected:
-                    return False
+        """Validiert Timing-Patterns (Zeile und Spalte 6 zwischen den Findern: schwarz bei geradem Index)"""
+        if size < 17:
             return True
-        except IndexError:
-            return False
+        expected = (np.arange(8, size - 8) % 2 == 0).astype(int)
+        return bool((grid[6, 8:size - 8] == expected).all() and (grid[8:size - 8, 6] == expected).all())
     
+    @staticmethod
+    def _finder_mask(size: int) -> np.ndarray:
+        mask = np.zeros((size, size), dtype=bool)
+        mask[:7, :7] = mask[:7, size - 7:] = mask[size - 7:, :7] = True
+        return mask
+
     def _check_patterns(self, grid: np.ndarray) -> float:
-        """Prüft typische QR-Code-Muster (ignoriert Finder Patterns)"""
+        """Prüft typische QR-Code-Muster (ignoriert Finder Patterns) - vektorisiert"""
         score = 1.0
         size = grid.shape[0]
+        finder = self._finder_mask(size)
         
-        # Helfer: Prüft ob Koordinate im Finder-Pattern liegt (7x7 Ecken)
-        def is_finder(r, c):
-            # Top-Left
-            if r < 7 and c < 7: return True
-            # Top-Right
-            if r < 7 and c >= size - 7: return True
-            # Bottom-Left
-            if r >= size - 7 and c < 7: return True
-            return False
-            
-        # Penalize lange Sequenzen gleicher Farbe (nur im Datenbereich)
-        max_run_penalty = 0
-        for i in range(size):
-            run_length = 1
-            for j in range(1, size):
-                # Skip wenn wir im Finder Pattern sind
-                if is_finder(i, j):
-                    run_length = 0 # Reset
-                    continue
-                    
-                if grid[i, j] == grid[i, j-1]:
-                    run_length += 1
-                else:
-                    run_length = 1
-                
-                if run_length > 5:
-                    max_run_penalty = max(max_run_penalty, run_length - 5)
+        # Lange Läufe gleicher Farbe je Zeile; Finder-Zellen unterbrechen einen Lauf
+        same = (grid[:, 1:] == grid[:, :-1]) & ~finder[:, 1:] & ~finder[:, :-1]
+        counts = np.cumsum(same, axis=1)
+        streak = counts - np.maximum.accumulate(np.where(same, 0, counts), axis=1)
+        longest_run = int(streak.max()) + 1 if streak.size else 1
+        score -= min(max(0, longest_run - 5) * 0.05, 0.3)
         
-        score -= min(max_run_penalty * 0.05, 0.3)
-        
-        # Penalize zu viele 2x2 Blöcke (ignoriere Finder Patterns)
-        block_penalty = 0
-        for i in range(size - 1):
-            for j in range(size - 1):
-                # Wenn irgendein Teil des 2x2 Blocks im Finder ist -> Skip
-                if is_finder(i, j) or is_finder(i+1, j+1):
-                    continue
-                    
-                block = grid[i:i+2, j:j+2]
-                if np.all(block == block[0, 0]):
-                    block_penalty += 1
-        
-        score -= min(block_penalty * 0.01, 0.2)
+        # Einfarbige 2×2-Blöcke (ohne Blöcke, die ein Finder-Pattern berühren)
+        top_left = grid[:-1, :-1]
+        uniform = (top_left == grid[:-1, 1:]) & (top_left == grid[1:, :-1]) & (top_left == grid[1:, 1:])
+        uniform &= ~(finder[:-1, :-1] | finder[1:, 1:])
+        score -= min(int(uniform.sum()) * 0.01, 0.2)
         
         return max(score, 0.0)
     
@@ -323,50 +256,23 @@ class QRValidator:
     
     def _try_decode(self, grid: np.ndarray) -> Tuple[Optional[str], float, str]:
         """
-        Versucht den QR-Code zu dekodieren
-        
-        Ein Versuch genügt: Die Polarität ist durch die festen (schwarzen) Finder-Patterns
-        vorgegeben, und größere Skalierung erhöht die Trefferquote bei zbar nicht.
-        
+        Dekodiert das Raster mit dem eigenen Decoder (Format, Reed-Solomon inkl. Fehlerkorrektur, Daten).
+
+        Früher pyzbar: zbar 0.10 in den Windows-Wheels bricht bei Symbolen mit Structured-Append-Kopf
+        den ganzen Prozess per Assertion ab - solche Symbole entstehen bei mehrdeutigen Rekonstruktionen.
+
         Returns:
             (decoded_data, score, debug_info)
         """
-        if not self.pyzbar_available:
-            return None, 0.0, "pyzbar nicht verfügbar"
-        
-        result = self._decode_attempt(grid)
-        if result is not None:
-            return result, 1.0, f"✓ Dekodiert: {result[:30]}..."
-        return None, 0.0, "✗ Dekodierung fehlgeschlagen"
-    
-    def _decode_attempt(self, grid: np.ndarray, scale: int = DECODE_SCALE) -> Optional[str]:
-        """Ein Dekodierungs-Versuch (0/1-Grid, 1 = schwarz)"""
-        try:
-            # QR-Matrix: 1 = schwarz, Bild: 0 = schwarz / 255 = weiß
-            img_array = ((1 - grid) * 255).astype(np.uint8)
-            img_array = np.pad(img_array, QUIET_ZONE, constant_values=255)
-            
-            # Nearest-Neighbor-Upscaling direkt in NumPy
-            if scale > 1:
-                img_array = img_array.repeat(scale, axis=0).repeat(scale, axis=1)
-            
-            if self.debug_mode:
-                debug_filename = f'debug_qr_images/qr_decode_{self.debug_counter}_s{scale}.png'
-                try:
-                    Image.fromarray(img_array).save(debug_filename)
-                except OSError as e:
-                    logger.debug("Debug-Bild konnte nicht gespeichert werden: %s", e)
-            
-            decoded = self.pyzbar.decode(img_array)
-            if decoded:
-                return decoded[0].data.decode('utf-8', errors='ignore')
-            return None
-        
-        except Exception as e:
-            logger.debug("Dekodierungs-Fehler: %s", e)
-            return None
-        finally:
-            self.debug_counter += 1
+        symbol = decode_grid(grid)
+        if self.debug_mode:
+            logger.debug("Dekodierversuch: %s", symbol)
+        if symbol is None:
+            return None, 0.0, "✗ Dekodierung fehlgeschlagen"
+        info = f"✓ Dekodiert ({symbol.ec_level}/Maske {symbol.mask}"
+        if symbol.corrected_errors:
+            info += f", {symbol.corrected_errors} Codewörter korrigiert"
+        return symbol.text, 1.0, info + f"): {symbol.text[:30]}..."
     
     def quick_validate(self, matrix: QRMatrix) -> bool:
         """Schnelle Validierung (nur Struktur)"""

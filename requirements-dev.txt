@@ -1,2 +1,4 @@
 -r tools/qr_reconstruction/requirements.txt
 pytest>=8.0
+# Unabhängige Referenz in den Tests (die App selbst braucht pyzbar/zbar nicht mehr)
+pyzbar>=0.1.9

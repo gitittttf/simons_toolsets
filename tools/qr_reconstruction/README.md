@@ -10,15 +10,13 @@ Reed-Solomon-Fehlerkorrektur, die jeder QR-Code ohnehin enthält.
 pip install -r tools/qr_reconstruction/requirements.txt
 ```
 
-`pyzbar` braucht zusätzlich die **zbar**-Bibliothek:
+Eine native Bibliothek wie zbar wird **nicht** benötigt: Das Tool dekodiert QR-Raster mit einem eigenen
+Decoder (`core/decoder.py`). Früher wurde dafür pyzbar/zbar verwendet – zbar 0.10 in den Windows-Wheels
+bricht aber bei bestimmten Symbolen (Structured-Append-Kopf, entsteht bei mehrdeutigen Rekonstruktionen)
+den ganzen Prozess per Assertion ab.
 
-- **Windows:** ist in den pyzbar-Wheels enthalten. Fehlt eine DLL, hilft meist das
-  [Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)
-  oder `conda install -c conda-forge pyzbar`.
-- **Linux:** `sudo apt install libzbar0`
-- **macOS:** `brew install zbar`
-
-Prüfen, ob alles funktioniert: `python tools/qr_reconstruction/check_pyzbar.py`
+pyzbar dient nur noch in den Tests als unabhängige Referenz (`pip install -r requirements-dev.txt`,
+unter Linux zusätzlich `sudo apt install libzbar0`, Diagnose: `python tools/qr_reconstruction/check_pyzbar.py`).
 
 ## Starten
 
@@ -101,7 +99,7 @@ Exit-Code: 0 = alles rekonstruiert, 1 = mindestens ein Bild ohne Lösung, 2 = Fe
    Großteil der Daten. Ein bekannter Textanfang legt weitere Bits fest. Jede Annahme liefert zusätzliche
    bekannte Bits für das Gleichungssystem. Beispiel: 50 % Schaden in einem Version-2-M-Code sind ohne
    Hinweis mehrdeutig (2^48 Lösungen), mit Textanfang `https://` eindeutig.
-6. **Gegenprobe:** Die rekonstruierte Matrix wird neu gerendert und von pyzbar gelesen.
+6. **Gegenprobe:** Die rekonstruierte Matrix wird neu gerendert und unabhängig neu dekodiert.
 
 | Modul | Aufgabe |
 |---|---|
@@ -115,7 +113,8 @@ Exit-Code: 0 = alles rekonstruiert, 1 = mindestens ein Bild ohne Lösung, 2 = Fe
 | `core/structure.py` | Struktur-Annahmen (Modus, Länge, Füllbytes, Textanfang) |
 | `core/export.py` | Matrix → PNG/SVG mit Ruhezone |
 | `core/bruteforce.py` | Pixel-Bruteforce (Fallback) |
-| `core/validator.py`, `core/content_scorer.py` | Bewertung mit pyzbar und Inhalts-Score |
+| `core/decoder.py` | Eigener Decoder für vollständige Raster (liest alles, was zbar liest, und mehr) |
+| `core/validator.py`, `core/content_scorer.py` | Bewertung (Struktur, Dekodierbarkeit, Inhalts-Score) |
 
 ## Grenzen
 
@@ -128,8 +127,7 @@ Exit-Code: 0 = alles rekonstruiert, 1 = mindestens ein Bild ohne Lösung, 2 = Fe
   lieber als unbekannt markieren als zu raten.
 - **Feste Muster** (Finder, Timing, Alignment, Version-Info) werden aus der Version erzeugt und
   sind nicht editierbar; die gewählte Version muss also stimmen.
-- **Zeichenkodierung:** Byte-Segmente ohne ECI werden als UTF-8 (sonst Latin-1) gelesen. pyzbar rät
-  die Kodierung selbst und zeigt Umlaute teils falsch an – der rekonstruierte Text ist davon unabhängig.
+- **Zeichenkodierung:** Byte-Segmente ohne ECI werden als UTF-8 (sonst Latin-1) gelesen.
 - **Bild-Import:** Geknickte/gewölbte Codes (nicht flach) werden nur über die vier Ecken entzerrt und
   können am Rand verrutschen; Flecken müssen von Hand markiert werden (siehe oben).
 

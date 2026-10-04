@@ -8,7 +8,7 @@ Pipeline:
   3. Jeden Block per Reed-Solomon rekonstruieren (rs_decoder.solve_block) - Blöcke sind unabhängig,
      die Kosten addieren sich also statt sich zu multiplizieren
   4. Datenbitstrom dekodieren; Terminator/Padding und Inhalt dienen zum Ranken mehrdeutiger Lösungen
-  5. Vollständige Matrix neu rendern und von pyzbar gegenprüfen lassen
+  5. Vollständige Matrix neu rendern und unabhängig neu dekodieren (Gegenprobe)
 
 Im Gegensatz zum Pixel-Bruteforce (2^unbekannte Pixel) ist die Laufzeit hier praktisch unabhängig
 von der Anzahl unbekannter Pixel, solange die Fehlerkorrektur sie abdeckt.
@@ -183,8 +183,10 @@ class Reconstructor:
 
     @staticmethod
     def _rank_key(cand: _Candidate) -> Tuple:
-        return (cand.padding_ok, -cand.fmt.mismatches, -cand.corrected_errors, -cand.ambiguous_bits,
-                cand.content)
+        # Inhalt vor Freiheitsgraden: Unter Struktur-Annahmen ist eine eindeutige Lösung aus Zahlensalat
+        # nicht plausibler als ein sinnvoller Text mit ein paar offenen Bits
+        return (cand.padding_ok, -cand.fmt.mismatches, -cand.corrected_errors, cand.content,
+                -cand.ambiguous_bits)
 
     def _solve_format(self, fmt: FormatCandidate, max_candidates: int, allow_errors: bool,
                       deadline: float) -> List[_Candidate]:
@@ -331,10 +333,10 @@ class Reconstructor:
 
     def _build_result(self, cand: _Candidate, total_candidates: int) -> ValidationResult:
         """
-        Rendert die Lösung, lässt sie von pyzbar gegenprüfen und berechnet die Confidence:
+        Rendert die Lösung, dekodiert sie zur Gegenprobe neu und berechnet die Confidence:
           40  RS-konsistent (Voraussetzung für jede Lösung)
         + 20  Format-Bits passen (anteilig)
-        + 15  Terminator/Padding korrekt
+        + 15  Terminator/Padding korrekt (unter Struktur-Annahmen nur bei eindeutiger Lösung - sonst erzwungen)
         + 25  Eindeutigkeit: eindeutig → voll (×0.8, wenn nur unter einer Struktur-Annahme),
               sonst halber Inhalts-Score
         -  5  je korrigiertem (falsch abgemaltem) Codewort
@@ -345,14 +347,16 @@ class Reconstructor:
         rendered.grid = grid.astype(int)
         rendered.locked[:] = True
         check = self.validator.validate(rendered)
-        pyzbar_text = check.decoded_data
+        reread_text = check.decoded_data
         content = self.validator.content_scorer.score_content(cand.text)
 
         unique = total_candidates == 1 and cand.ambiguous_bits == 0
         certainty = 1.0 if unique else 0.5 * content.total_score
         if cand.assumption:
             certainty *= 0.8
-        confidence = (40 + 20 * cand.fmt.score + 15 * cand.padding_ok + 25 * certainty
+        # Unter Struktur-Annahmen ist das Padding erzwungen - Beleg ist dann nur, dass genau eine Annahme passt
+        padding_evidence = cand.padding_ok and (not cand.assumption or unique)
+        confidence = (40 + 20 * cand.fmt.score + 15 * padding_evidence + 25 * certainty
                       - 5 * cand.corrected_errors)
         if not cand.complete:
             confidence = min(confidence, INCOMPLETE_CONFIDENCE_CAP)
@@ -363,7 +367,7 @@ class Reconstructor:
                  f"{cand.unknown_codewords} Codewörter rekonstruiert | "
                  f"{cand.corrected_errors} Fehler korrigiert | "
                  f"2^{cand.ambiguous_bits} Lösungen{'' if cand.complete else ' (nicht alle geprüft)'} | "
-                 f"Padding {'ok' if cand.padding_ok else 'abweichend'} | pyzbar: {pyzbar_text!r}")
+                 f"Padding {'ok' if cand.padding_ok else 'abweichend'} | Gegenprobe: {reread_text!r}")
         if cand.assumption:
             debug += f" | Annahme: {cand.assumption}"
 
@@ -384,8 +388,7 @@ class Reconstructor:
         check.ambiguous_bits = cand.ambiguous_bits
         check.padding_ok = cand.padding_ok
         check.assumption = cand.assumption
-        # Ein Standard-Decoder akzeptiert das rekonstruierte Symbol. Den Text vergleichen wir bewusst
-        # nicht: zbar rät die Zeichenkodierung von Byte-Segmenten und liest UTF-8 teils als Shift-JIS.
-        check.decoder_confirmed = pyzbar_text is not None
+        # Gegenprobe: Das gerenderte Symbol (Format, Maske, Interleaving, EC) wird wieder zum selben Text gelesen
+        check.decoder_confirmed = reread_text == cand.text
         check.debug_info = debug
         return check

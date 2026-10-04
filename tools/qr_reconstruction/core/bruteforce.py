@@ -162,7 +162,7 @@ class BruteforceEngine:
         self.result_callback: Optional[Callable] = None
         self._should_stop = False
         self._stop_event: Any = None  # multiprocessing.Event während eines Laufs
-        # Beste Lösung je dekodiertem Text (pyzbar korrigiert intern Fehler,
+        # Beste Lösung je dekodiertem Text (der Decoder korrigiert Fehler,
         # daher liefern viele Kandidaten denselben Inhalt)
         self._results_by_data: Dict[Optional[str], ValidationResult] = {}
 

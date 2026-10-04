@@ -784,7 +784,7 @@ Ein QR-Code hat typischerweise eine ausgeglichene Anzahl von schwarzen und weiß
 Starke Abweichungen (zu weiß oder zu schwarz) senken diesen Wert.
 
 4. Dekodierung (Decode Score)
-Dies ist der wichtigste Test. Wir versuchen, den Code mit einer Standard-Bibliothek (pyzbar) zu lesen.
+Dies ist der wichtigste Test. Der Code wird vollständig dekodiert (Format, Reed-Solomon-Fehlerkorrektur, Daten).
 • 100% = Code ist lesbar!
 • 0% = Code konnte nicht gelesen werden.
 

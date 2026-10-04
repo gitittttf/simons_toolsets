@@ -14,7 +14,10 @@ dann übernimmt klassische Fehler+Erasure-Korrektur (reedsolo): 2·Fehler + Eras
 """
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 try:
     from reedsolo import RSCodec, ReedSolomonError
@@ -42,16 +45,30 @@ def gf_mul(a: int, b: int) -> int:
     return _EXP[_LOG[a] + _LOG[b]]
 
 
+_EXP_NP = np.array(_EXP, dtype=np.int64)
+_LOG_NP = np.array(_LOG, dtype=np.int64)
+
+
+@lru_cache(maxsize=None)
+def _syndrome_exponents(n: int, nsym: int) -> np.ndarray:
+    """Exponent von α für Codewort i in Syndrom j: j·(n-1-i) mod 255"""
+    j = np.arange(nsym)[:, None]
+    i = np.arange(n)[None, :]
+    return (j * (n - 1 - i)) % 255
+
+
 def syndromes(codeword: List[int], nsym: int) -> List[int]:
-    """S_j für j = 0..nsym-1 (Horner-Schema)"""
-    result = []
-    for j in range(nsym):
-        alpha_j = _EXP[j]
-        s = 0
-        for c in codeword:
-            s = gf_mul(s, alpha_j) ^ c
-        result.append(s)
-    return result
+    """S_j = Σ c_i·α^(j·(n-1-i)) für j = 0..nsym-1 (vektorisiert: XOR-Summe der Produkte über log/exp)"""
+    c = np.asarray(codeword, dtype=np.int64)
+    terms = _EXP_NP[(_LOG_NP[c][None, :] + _syndrome_exponents(len(c), nsym)) % 255]
+    terms[:, c == 0] = 0
+    return np.bitwise_xor.reduce(terms, axis=1).tolist()
+
+
+@lru_cache(maxsize=None)
+def _codec(nsym: int):
+    """reedsolo baut bei jeder Instanz seine Tabellen neu - daher je nsym nur einmal"""
+    return RSCodec(nsym)
 
 
 def _pack(values: List[int]) -> int:
@@ -157,7 +174,7 @@ def _correct_with_errors(values: List[int], known_masks: List[int], nsym: int) -
     if len(erase_pos) + 2 > nsym:  # Platz für mindestens einen Fehler nötig
         return None
     try:
-        _, corrected, _ = RSCodec(nsym).decode(bytearray(values), erase_pos=erase_pos or None)
+        _, corrected, _ = _codec(nsym).decode(bytearray(values), erase_pos=erase_pos or None)
     except ReedSolomonError:
         return None
     corrected = list(corrected)
