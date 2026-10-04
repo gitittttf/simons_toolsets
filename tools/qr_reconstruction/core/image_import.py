@@ -7,8 +7,9 @@ Ablauf:
   2. Perspektive entzerren und Beleuchtung ausgleichen
   3. Für jede Orientierung und jede Version das Raster abtasten; gewählt wird die Kombination,
      bei der die festen Muster (Finder, Timing, Alignment, Version-Info) am besten passen
-  4. Unsichere Module (Grauwert nahe der Schwelle) und große einfarbige Flächen (typisch für Flecken
-     oder Reflexe, in echten QR-Daten selten) werden als unbekannt markiert
+  4. Als unbekannt markiert werden: unsichere Module (Grauwert nahe der Schwelle), farbige Module
+     (z.B. roter Stift - ein dunkelroter Fleck wäre in Graustufen sonst "sicher schwarz") und große
+     einfarbige Flächen (typisch für Flecken oder Reflexe, in echten QR-Daten selten)
 
 Flecken, die Module vollständig überdecken, sind im Bild nicht von echten Modulen zu unterscheiden -
 die muss der Nutzer im Editor als unbekannt markieren (dafür gibt es das entzerrte Foto als Hintergrund).
@@ -32,6 +33,11 @@ SAMPLE_PX = 10
 UNSURE_CONTRAST = 0.35
 # Einfarbige Flächen ab dieser Kantenlänge (in Modulen) gelten als verdächtig
 SOLID_AREA = 4
+# Buntheit (max - min der mittleren Modulfarbe, 0-255), ab der ein Modul als farbiger Fleck gilt -
+# QR-Codes sind schwarz/weiß. Absolut statt HSV-Sättigung, weil die bei dunklen, verrauschten Pixeln springt.
+COLOR_CHROMA = 50
+# Ist mehr als dieser Anteil der Module farbig, ist der Code selbst farbig gedruckt → keine Farberkennung
+COLORED_CODE_FRACTION = 0.4
 
 
 class ImageImportError(Exception):
@@ -45,7 +51,7 @@ class ImportResult:
     unsure: np.ndarray         # bool [n, n]: als unbekannt vorschlagen
     pattern_score: float       # Anteil passender Module der festen Muster (1.0 = perfekt)
     corners: np.ndarray        # 4×2, Reihenfolge oben-links, oben-rechts, unten-rechts, unten-links
-    warped: np.ndarray         # entzerrtes Graubild (uint8) des Codes, für den Editor-Hintergrund
+    warped: np.ndarray         # entzerrtes Bild des Codes (uint8, RGB oder grau) für den Editor-Hintergrund
 
     def to_matrix(self) -> QRMatrix:
         """QRMatrix mit festen Mustern aus der Spezifikation und abgetasteten Datenmodulen"""
@@ -192,6 +198,17 @@ def refine_corners(gray: np.ndarray, corners: np.ndarray, reference: QRMatrix) -
     return corners
 
 
+def colored_modules(image: np.ndarray, corners: np.ndarray, n: int) -> np.ndarray:
+    """Module mit deutlicher Farbe (farbige Flecken/Stifte); leer bei farbig gedruckten Codes"""
+    # Erst je Modul die mittlere Farbe bilden (mittelt Rauschen weg), dann deren Buntheit
+    channels = [_module_values(_warp(image[:, :, i].astype(np.float32), corners), n) for i in range(3)]
+    stacked = np.stack(channels)
+    colored = (stacked.max(axis=0) - stacked.min(axis=0)) > COLOR_CHROMA
+    if colored.mean() > COLORED_CODE_FRACTION:
+        return np.zeros_like(colored)
+    return colored
+
+
 def sample_grid(image: np.ndarray, corners: np.ndarray, sizes: Optional[List[int]] = None,
                 refine: bool = True) -> ImportResult:
     """
@@ -239,7 +256,13 @@ def sample_grid(image: np.ndarray, corners: np.ndarray, sizes: Optional[List[int
     score, n, black, contrast, rotated, flat = best
     fixed = fixed_masks[n].fixed
     unsure = (contrast < UNSURE_CONTRAST) | solid_areas(black, fixed)
+    if image.ndim == 3:
+        unsure |= colored_modules(image, rotated, n)
     unsure &= ~fixed
-    warped = np.clip(flat, 0, 255).astype(np.uint8)
+    if image.ndim == 3:
+        # In Farbe, damit farbige Flecken im Editor sofort auffallen
+        warped = cv2.cvtColor(_warp(image, rotated), cv2.COLOR_BGR2RGB)
+    else:
+        warped = np.clip(flat, 0, 255).astype(np.uint8)
     return ImportResult(size=n, black=black, unsure=unsure, pattern_score=score,
                         corners=rotated, warped=warped)

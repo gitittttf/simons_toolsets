@@ -53,11 +53,12 @@ Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick.
 2. Die Ecken des Codes werden automatisch gesucht. Findet OpenCV nichts – typisch, wenn ein
    Finder-Pattern beschädigt ist –, zieht man die vier Punkte von Hand auf die Ecken. Ungefähr reicht:
    Die Ecken werden anhand der Finder- und Timing-Muster nachjustiert.
-3. Das Bild wird entzerrt, die Version automatisch erkannt und jedes Modul abgetastet. Unsichere Module
-   und große einfarbige Flächen werden als unbekannt markiert.
+3. Das Bild wird entzerrt, die Version automatisch erkannt und jedes Modul abgetastet. Als unbekannt
+   markiert werden unsichere Module, **farbige** Module (z. B. ein roter Stift – QR-Codes sind
+   schwarz/weiß) und große einfarbige Flächen.
 4. Im Editor liegt das entzerrte Foto hinter dem Raster (Schalter „Foto hinter dem Raster anzeigen“).
-   **Flecken, Knicke und Reflexe per Rechtsklick als unbekannt markieren** – ein komplett überdecktes
-   Modul sieht im Bild genauso aus wie ein echtes, das kann der Import nicht sicher erkennen.
+   **Schwarze/graue Flecken, Knicke und Reflexe per Rechtsklick als unbekannt markieren** – ein komplett
+   überdecktes Modul sieht im Bild genauso aus wie ein echtes, das kann der Import nicht sicher erkennen.
    Die Lösbarkeitsanzeige zeigt sofort, ob es reicht.
 
 Der Import braucht OpenCV (`opencv-python`, in den Requirements enthalten); ohne OpenCV läuft das Tool

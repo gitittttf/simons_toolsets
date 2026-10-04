@@ -68,6 +68,49 @@ def test_blob_marked_by_user_is_solvable():
     assert Reconstructor(matrix).run(max_time=10)[0].decoded_data == URL
 
 
+def test_dark_colored_blob_is_marked_unknown():
+    """Dunkelrot ist in Graustufen fast schwarz - ohne Farberkennung wären das sichere, aber falsche Pixel"""
+    image, truth = code_image(URL)
+    damaged = blob(image, 250, 270, 70, color=(20, 20, 140))   # BGR: dunkelrot; ohne Farberkennung scheitert's
+    result = image_import.sample_grid(damaged, image_import.detect_corners(damaged))
+    assert wrong_known(result, truth) == 0
+    top = Reconstructor(result.to_matrix()).run(max_time=10)[0]
+    assert top.decoded_data == URL and top.ambiguous_bits == 0
+
+
+def test_color_noise_in_photo_is_not_damage():
+    """Regression: HSV-Sättigung sprang bei dunklen, verrauschten Pixeln - Buntheit der Modul-Mittelwerte nicht"""
+    image, _ = code_image(URL)
+    noisy = photo(image)
+    corners = image_import.detect_corners(noisy)
+    result = image_import.sample_grid(noisy, corners)
+    assert image_import.colored_modules(noisy, result.corners, result.size).sum() == 0
+
+
+def test_colored_code_is_not_treated_as_damage():
+    """Ein blau gedruckter Code darf nicht komplett als Fleck gelten"""
+    image, truth = code_image(URL)
+    blue = image.copy()
+    blue[(image == 0).all(axis=2)] = (160, 60, 0)                 # schwarze Module blau einfärben
+    result = image_import.sample_grid(blue, image_import.detect_corners(blue))
+    assert result.unsure.sum() < 20
+    assert wrong_known(result, truth) == 0
+
+
+def test_user_sample_image():
+    """Vom Nutzer beigesteuertes Bild: Version-2-Code mit rotem Fleck"""
+    from pathlib import Path
+    path = Path(__file__).parent.parent / "test_qr_code_obstructed.png"
+    if not path.exists():
+        pytest.skip("Beispielbild fehlt")
+    image = image_import.load_image(str(path))
+    result = image_import.sample_grid(image, image_import.detect_corners(image))
+    assert result.size == 25
+    results = Reconstructor(result.to_matrix()).run(max_time=10)
+    assert results[0].decoded_data == 'https://aniworld.to/'
+    assert results[0].ambiguous_bits == 0
+
+
 def test_to_matrix_keeps_fixed_patterns_and_marks_unsure():
     image, _ = code_image(URL)
     result = image_import.sample_grid(image, image_import.detect_corners(image))
@@ -75,7 +118,7 @@ def test_to_matrix_keeps_fixed_patterns_and_marks_unsure():
     matrix = result.to_matrix()
     assert matrix.fixed[0, 0] and matrix.locked[0, 0]
     assert not matrix.locked[12, 12]
-    assert result.warped.shape == (image_import.WARP_SIZE, image_import.WARP_SIZE)
+    assert result.warped.shape == (image_import.WARP_SIZE, image_import.WARP_SIZE, 3)
 
 
 def test_solid_areas():

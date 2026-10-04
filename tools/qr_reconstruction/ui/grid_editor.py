@@ -220,7 +220,7 @@ class GridEditor(ctk.CTkFrame):
         )
 
     def set_photo(self, photo: Optional[np.ndarray], show: bool = True):
-        """Setzt das entzerrte Foto (Graubild, quadratisch) als Hintergrund"""
+        """Setzt das entzerrte Foto (quadratisch, RGB oder grau) als Hintergrund"""
         self.photo = photo
         self.show_photo = show and photo is not None
         self._photo_cache = (None, None)
