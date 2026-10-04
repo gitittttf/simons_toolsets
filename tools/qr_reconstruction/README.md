@@ -33,7 +33,8 @@ Nicht `main_window.py` direkt starten – die relativen Imports funktionieren nu
 
 ## Bedienung
 
-1. **Version wählen** (Größe des Codes, z. B. 25×25 = Version 2) oder das GitHub-Preset laden.
+1. **Bild importieren** (Foto oder Screenshot) – oder eine **Version wählen** (Größe des Codes,
+   z. B. 25×25 = Version 2) und den Code abmalen, oder das GitHub-Preset laden.
 2. **Abmalen:** Linksklick bzw. Ziehen malt Schwarz/Weiß – gemalte Pixel gelten als *bekannt*.
    Tipp: nur die schwarzen Pixel malen, dann „Unbekannte → Weiß“.
 3. **Schaden markieren:** Rechtsklick bzw. Ziehen markiert Pixel als *unbekannt* (grau mit „?“);
@@ -45,6 +46,22 @@ Nicht `main_window.py` direkt starten – die relativen Imports funktionieren nu
    als Fallback einen Pixel-Bruteforce an.
 
 Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick.
+
+### Bild-Import
+
+1. „📷 Bild importieren“ und ein Foto/einen Screenshot wählen (PNG, JPG, BMP, WebP, TIFF).
+2. Die Ecken des Codes werden automatisch gesucht. Findet OpenCV nichts – typisch, wenn ein
+   Finder-Pattern beschädigt ist –, zieht man die vier Punkte von Hand auf die Ecken. Ungefähr reicht:
+   Die Ecken werden anhand der Finder- und Timing-Muster nachjustiert.
+3. Das Bild wird entzerrt, die Version automatisch erkannt und jedes Modul abgetastet. Unsichere Module
+   und große einfarbige Flächen werden als unbekannt markiert.
+4. Im Editor liegt das entzerrte Foto hinter dem Raster (Schalter „Foto hinter dem Raster anzeigen“).
+   **Flecken, Knicke und Reflexe per Rechtsklick als unbekannt markieren** – ein komplett überdecktes
+   Modul sieht im Bild genauso aus wie ein echtes, das kann der Import nicht sicher erkennen.
+   Die Lösbarkeitsanzeige zeigt sofort, ob es reicht.
+
+Der Import braucht OpenCV (`opencv-python`, in den Requirements enthalten); ohne OpenCV läuft das Tool
+weiter, nur der Import ist dann nicht verfügbar.
 
 ## Wie es funktioniert
 
@@ -68,6 +85,7 @@ Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick.
 | `core/data_decoder.py` | Bitstrom → Text |
 | `core/reconstructor.py` | Gesamte Pipeline |
 | `core/analysis.py` | Lösbarkeitsanalyse für den Editor |
+| `core/image_import.py` | Bild → Matrix (Ecken, Entzerren, Version, Abtasten) |
 | `core/bruteforce.py` | Pixel-Bruteforce (Fallback) |
 | `core/validator.py`, `core/content_scorer.py` | Bewertung mit pyzbar und Inhalts-Score |
 
@@ -84,7 +102,8 @@ Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick.
   sind nicht editierbar; die gewählte Version muss also stimmen.
 - **Zeichenkodierung:** Byte-Segmente ohne ECI werden als UTF-8 (sonst Latin-1) gelesen. pyzbar rät
   die Kodierung selbst und zeigt Umlaute teils falsch an – der rekonstruierte Text ist davon unabhängig.
-- Kein Bild-Import: Der Code muss bisher von Hand abgemalt werden.
+- **Bild-Import:** Geknickte/gewölbte Codes (nicht flach) werden nur über die vier Ecken entzerrt und
+  können am Rand verrutschen; Flecken müssen von Hand markiert werden (siehe oben).
 
 ## Tests
 

@@ -1,5 +1,7 @@
 import customtkinter as ctk
-from typing import Callable, Optional, Set, Tuple
+import numpy as np
+from PIL import Image, ImageTk
+from typing import Any, Callable, Optional, Set, Tuple
 from ..core.qr_matrix import QRMatrix, CellState
 from ..core.analysis import (
     BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, SolvabilityReport,
@@ -62,6 +64,12 @@ class GridEditor(ctk.CTkFrame):
         self.hovered_cell = None
         # Solange der Nutzer nicht selbst zoomt/verschiebt, bleibt der Code bei Größenänderung zentriert
         self.user_moved_view = False
+        
+        # Foto-Hintergrund (entzerrtes Bild aus dem Import)
+        self.photo: Optional[np.ndarray] = None
+        self.show_photo = False
+        # (Schlüssel, PhotoImage) - nur bei Zoom/Pan neu skalieren
+        self._photo_cache: Tuple[Any, Any] = (None, None)
         
         # Overlay (Lösbarkeit je Block, Format-Info)
         self.overlay_enabled = False
@@ -179,6 +187,9 @@ class GridEditor(ctk.CTkFrame):
             tags="board_bg"
         )
         
+        if self.show_photo and self.photo is not None:
+            self._draw_photo(total_size)
+        
         # Simple mode for tiny cells to improve performance
         simple_mode = cell_pixel_size < 4
         
@@ -207,6 +218,33 @@ class GridEditor(ctk.CTkFrame):
             self.offset_x + total_size, self.offset_y + total_size,
             outline=Colors.ACCENT, width=Dimensions.GRID_OUTER_BORDER_WIDTH
         )
+
+    def set_photo(self, photo: Optional[np.ndarray], show: bool = True):
+        """Setzt das entzerrte Foto (Graubild, quadratisch) als Hintergrund"""
+        self.photo = photo
+        self.show_photo = show and photo is not None
+        self._photo_cache = (None, None)
+        self.render()
+
+    def _draw_photo(self, total_size: float):
+        """Zeichnet den sichtbaren Ausschnitt des Fotos (gecacht, solange sich Zoom/Ausschnitt nicht ändern)"""
+        if self.photo is None:
+            return
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        # Sichtbarer Bereich in Grid-Pixeln
+        x0, y0 = max(0.0, -self.offset_x), max(0.0, -self.offset_y)
+        x1, y1 = min(total_size, cw - self.offset_x), min(total_size, ch - self.offset_y)
+        if x1 - x0 < 1 or y1 - y0 < 1:
+            return
+        key = (round(total_size), round(x0), round(y0), round(x1), round(y1))
+        if self._photo_cache[0] != key:
+            scale = self.photo.shape[0] / total_size
+            crop = self.photo[int(y0 * scale):max(int(y0 * scale) + 1, int(y1 * scale)),
+                              int(x0 * scale):max(int(x0 * scale) + 1, int(x1 * scale))]
+            image = Image.fromarray(crop).resize((key[3] - key[1], key[4] - key[2]), Image.Resampling.BILINEAR)
+            self._photo_cache = (key, ImageTk.PhotoImage(image))
+        self.canvas.create_image(self.offset_x + key[1], self.offset_y + key[2],
+                                 image=self._photo_cache[1], anchor="nw")
 
     def set_overlay(self, report: Optional[SolvabilityReport], enabled: Optional[bool] = None):
         """Setzt die Analyse für das Overlay (und optional, ob es angezeigt wird) und zeichnet neu"""
@@ -237,6 +275,38 @@ class GridEditor(ctk.CTkFrame):
         known = self.matrix.locked[r, c]
         fixed = self.matrix._is_fixed_pattern(r, c)
         
+        if self.show_photo and self.photo is not None:
+            self._draw_photo_cell(x, y, size, val, known, fixed, simple_mode)
+        else:
+            self._draw_plain_cell(x, y, size, val, known, fixed, simple_mode)
+
+        # Overlay als farbiger Innenrahmen (Stipple-Füllungen gibt es nicht auf allen Plattformen)
+        overlay = self._overlay_color(r, c)
+        if overlay:
+            inset = max(1.0, size * 0.12)
+            self.canvas.create_rectangle(
+                x + inset, y + inset, x + size - inset, y + size - inset,
+                outline=overlay, width=max(1, int(size * 0.12)),
+            )
+
+    def _draw_photo_cell(self, x, y, size, val, known, fixed, simple_mode):
+        """Foto sichtbar lassen: bekannt = kleiner Punkt in der abgetasteten Farbe, unbekannt = orange '?'"""
+        if fixed or simple_mode:
+            return
+        if known:
+            r = size * 0.16
+            cx, cy = x + size / 2, y + size / 2
+            fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=Colors.ACCENT, width=1)
+        else:
+            self.canvas.create_rectangle(x + 1, y + 1, x + size - 1, y + size - 1,
+                                         outline=Colors.QR_PAINTING, width=2)
+            if size > 12:
+                self.canvas.create_text(x + size / 2, y + size / 2, text="?", fill=Colors.QR_PAINTING,
+                                        font=(Dimensions.GRID_MARKER_FONT,
+                                              int(size / Dimensions.GRID_MARKER_LOCKED_DIVIDER), "bold"))
+
+    def _draw_plain_cell(self, x, y, size, val, known, fixed, simple_mode):
         if fixed:
             fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
             outline = Colors.QR_PATTERN_BORDER
@@ -266,15 +336,6 @@ class GridEditor(ctk.CTkFrame):
                          cx, cy, text="?", fill=Colors.QR_UNKNOWN_MARK,
                          font=(Dimensions.GRID_MARKER_FONT, int(size/Dimensions.GRID_MARKER_LOCKED_DIVIDER))
                      )
-
-        # Overlay als farbiger Innenrahmen (Stipple-Füllungen gibt es nicht auf allen Plattformen)
-        overlay = self._overlay_color(r, c)
-        if overlay:
-            inset = max(1.0, size * 0.12)
-            self.canvas.create_rectangle(
-                x + inset, y + inset, x + size - inset, y + size - inset,
-                outline=overlay, width=max(1, int(size * 0.12)),
-            )
 
     def _draw_cursor_hl(self, r, c):
         self.canvas.delete("hl")

@@ -8,17 +8,19 @@ Features:
 """
 
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import logging
 import queue
 import threading
 import sys
 from typing import Optional
 from .grid_editor import GridEditor
+from .corner_dialog import CornerDialog
 from .results_view import ResultsView
 from ..core.qr_matrix import QRMatrix, QR_VERSIONS
 from ..core.bruteforce import BruteforceEngine
 from ..core.reconstructor import Reconstructor
+from ..core import image_import
 from ..core.analysis import (
     VERDICT_AMBIGUOUS, VERDICT_COMPLETE, VERDICT_CORRECTABLE, VERDICT_INCONSISTENT, VERDICT_UNIQUE,
     BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, analyze_solvability,
@@ -77,6 +79,10 @@ class MainWindowMixin:
         self.grid_editor: Optional[GridEditor] = None
         self.editor_controls = None
         self.results_view: Optional[ResultsView] = None
+        
+        # Foto aus dem Bild-Import (entzerrt, Graubild) als Editor-Hintergrund
+        self.photo = None
+        self.photo_on = True
         
         # Lösbarkeitsanalyse (läuft entprellt im Hintergrund)
         self.overlay_on = False
@@ -220,6 +226,21 @@ class MainWindowMixin:
             border_color=Colors.ACCENT
         ).pack(side="left", padx=10)
         
+        # Bild-Import
+        ctk.CTkLabel(version_section, text="- oder -", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(pady=10)
+        ctk.CTkButton(
+            version_section,
+            text="📷 Bild importieren (Foto / Screenshot)",
+            command=self._import_image,
+            width=320,
+            height=44,
+            font=Fonts.BUTTON_LARGE,
+            fg_color=Colors.ACCENT,
+            text_color="#ffffff",
+            hover_color=Colors.ACCENT_HOVER,
+            corner_radius=Dimensions.CORNER_RADIUS_M
+        ).pack(pady=(0, 10))
+        
         # Info
         ctk.CTkLabel(
             center,
@@ -275,7 +296,82 @@ class MainWindowMixin:
     def _create_matrix(self, size: int):
         """Erstellt Matrix"""
         self.matrix = QRMatrix(size=size)
+        self.photo = None
         self._build_editor_view()
+
+    # ------------------------------------------------------------------ Bild-Import
+    def _import_image(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="QR-Code-Bild öffnen",
+            filetypes=[("Bilder", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"), ("Alle Dateien", "*.*")])
+        if not path:
+            return
+        try:
+            image = image_import.load_image(path)
+            corners = image_import.detect_corners(image)
+        except image_import.ImageImportError as e:
+            messagebox.showerror("Bild-Import", str(e), parent=self)
+            return
+        CornerDialog(self, image, corners, on_accept=lambda c: self._run_import(image, c))
+
+    def _run_import(self, image, corners):
+        """Abtasten im Hintergrund (bei großen Versionen einige Sekunden), dann in den Editor"""
+        busy = ctk.CTkToplevel(self)
+        busy.title("Bild-Import")
+        busy.configure(fg_color=Colors.BG_PRIMARY)
+        busy.resizable(False, False)
+        ctk.CTkLabel(busy, text="Bild wird analysiert …", font=Fonts.BODY,
+                     text_color=Colors.TEXT_PRIMARY).pack(padx=40, pady=(20, 8))
+        bar = ctk.CTkProgressBar(busy, mode="indeterminate", width=260, progress_color=Colors.ACCENT)
+        bar.pack(padx=40, pady=(0, 20))
+        bar.start()
+        busy.transient(self)
+
+        results: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                results.put(image_import.sample_grid(image, corners))
+            except Exception as e:  # dem Nutzer melden statt den Thread still sterben zu lassen
+                logger.exception("Bild-Import fehlgeschlagen")
+                results.put(e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                outcome = results.get_nowait()
+            except queue.Empty:
+                self.after(50, poll)
+                return
+            busy.destroy()
+            if isinstance(outcome, Exception):
+                messagebox.showerror("Bild-Import", f"Das Bild konnte nicht ausgewertet werden:\n{outcome}",
+                                     parent=self)
+                return
+            self._apply_import(outcome)
+
+        self.after(50, poll)
+
+    def _apply_import(self, result):
+        if result.pattern_score < 0.85 and not messagebox.askyesno(
+                "Bild-Import",
+                f"Die festen Muster (Finder, Timing) passen nur zu {result.pattern_score:.0%} - "
+                "vermutlich sitzen die Ecken nicht richtig.\n\nTrotzdem übernehmen?", parent=self):
+            return
+        self.matrix = result.to_matrix()
+        self.photo = result.warped
+        self.photo_on = True
+        self._build_editor_view()
+        unsure = int(result.unsure.sum())
+        messagebox.showinfo(
+            "Bild-Import",
+            f"Version {self.matrix.version} ({result.size}×{result.size}) erkannt, "
+            f"feste Muster passen zu {result.pattern_score:.0%}.\n"
+            f"{unsure} unsichere Module wurden als unbekannt markiert.\n\n"
+            "Flecken, Knicke oder Reflexe erkennt das Tool nicht sicher: Markiere beschädigte "
+            "Stellen per Rechtsklick als unbekannt. Das Foto liegt dafür hinter dem Raster "
+            "(Schalter „Foto anzeigen“).", parent=self)
     
     def _build_editor_view(self):
         """Editor View mit neuem Sidebar-Layout"""
@@ -291,6 +387,8 @@ class MainWindowMixin:
         
         self.grid_editor = GridEditor(canvas_container, self.matrix)
         self.grid_editor.pack(fill="both", expand=True)
+        if self.photo is not None:
+            self.grid_editor.set_photo(self.photo, show=self.photo_on)
         
         def on_change(r, c):
             self._update_stats_sidebar()
@@ -355,6 +453,21 @@ class MainWindowMixin:
             stats_frame, text="", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED,
             wraplength=270, justify="left", anchor="w")
         self.analysis_blocks.pack(fill="x", pady=(2, 0))
+        
+        # Foto-Schalter (nur nach Bild-Import)
+        if self.photo is not None:
+            photo_var = ctk.BooleanVar(value=self.photo_on)
+            
+            def toggle_photo():
+                self.photo_on = photo_var.get()
+                self.grid_editor.show_photo = self.photo_on
+                self.grid_editor.render()
+            
+            ctk.CTkSwitch(
+                stats_frame, text="Foto hinter dem Raster anzeigen", variable=photo_var,
+                command=toggle_photo, font=Fonts.SMALL, text_color=Colors.TEXT_PRIMARY,
+                progress_color=Colors.ACCENT,
+            ).pack(anchor="w", pady=(10, 0))
         
         # Overlay-Schalter + Legende
         overlay_var = ctk.BooleanVar(value=self.overlay_on)
