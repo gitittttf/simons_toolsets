@@ -14,7 +14,7 @@ dann übernimmt klassische Fehler+Erasure-Korrektur (reedsolo): 2·Fehler + Eras
 """
 
 from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 try:
     from reedsolo import RSCodec, ReedSolomonError

@@ -17,7 +17,7 @@ von der Anzahl unbekannter Pixel, solange die Fehlerkorrektur sie abdeckt.
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -95,7 +95,7 @@ class Reconstructor:
         self.progress_callback: Optional[Callable] = None
         self.result_callback: Optional[Callable] = None
         self._should_stop = False
-        self.stats = {'tested': 0, 'valid': 0, 'start_time': None, 'end_time': None, 'mode': 'rs'}
+        self.stats: Dict[str, Any] = {'tested': 0, 'valid': 0, 'start_time': None, 'end_time': None, 'mode': 'rs'}
 
     def stop(self):
         self._should_stop = True

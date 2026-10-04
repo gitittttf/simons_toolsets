@@ -110,9 +110,7 @@ class QRMatrix:
         Args:
             size: Muss eine offizielle QR-Größe sein (21, 25, 29, ...)
         """
-        self.version = get_version_for_size(size)
-        
-        if self.version is None:
+        if get_version_for_size(size) is None:
             # Finde nächste gültige Größe
             valid_sizes = VALID_QR_SIZES
             if size < valid_sizes[0]:
@@ -125,8 +123,10 @@ class QRMatrix:
                     if vs >= size:
                         size = vs
                         break
-            self.version = get_version_for_size(size)
         
+        version = get_version_for_size(size)
+        assert version is not None
+        self.version: int = version
         self.size = size
         self.grid = np.full((size, size), CellState.UNKNOWN, dtype=int)
         self.locked = np.zeros((size, size), dtype=bool)

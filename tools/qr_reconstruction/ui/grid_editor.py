@@ -1,6 +1,5 @@
 import customtkinter as ctk
 from typing import Callable, Optional, Set, Tuple
-import numpy as np
 from ..core.qr_matrix import QRMatrix, CellState
 from ..core.analysis import (
     BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, SolvabilityReport,
@@ -223,7 +222,8 @@ class GridEditor(ctk.CTkFrame):
             return None
         if (r, c) in self._overlay_format_cells:
             return Colors.OVERLAY_FORMAT
-        if report.module_affected is not None and report.module_affected[r, c]:
+        if (report.module_affected is not None and report.module_block is not None
+                and report.module_affected[r, c]):
             block = report.module_block[r, c]
             if 0 <= block < len(report.blocks):
                 return OVERLAY_COLORS[report.blocks[block].status]

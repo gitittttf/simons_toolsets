@@ -1,5 +1,7 @@
 """
-Verbessertes Test-Script um pyzbar-Installation zu prüfen
+Diagnose-Skript: prüft, ob pyzbar und die zbar-Bibliothek funktionieren
+
+Aufruf aus dem Projektordner: python tools/qr_reconstruction/check_pyzbar.py
 """
 
 import numpy as np
@@ -49,7 +51,7 @@ try:
     decoded = pyzbar.decode(img)
     
     if decoded:
-        print(f"  ✓ Dekodierung erfolgreich!")
+        print("  ✓ Dekodierung erfolgreich!")
         print(f"  Anzahl gefundener Codes: {len(decoded)}")
         for i, obj in enumerate(decoded):
             print(f"  Code {i+1}:")
@@ -103,7 +105,7 @@ for name, grid_func in test_cases:
         if decoded:
             print(f"    ✓ Funktioniert: {decoded[0].data.decode('utf-8')}")
         else:
-            print(f"    ✗ Keine Dekodierung")
+            print("    ✗ Keine Dekodierung")
     except Exception as e:
         print(f"    ✗ Fehler: {e}")
 

@@ -134,13 +134,13 @@ def decode_data(data: bytes, version: int) -> DecodedData:
 
         elif mode == MODE_KANJI:
             count = reader.read(char_count_bits(mode, version))
-            raw = bytearray()
+            kanji = bytearray()
             for _ in range(count):
                 value = reader.read(13)
                 code = ((value // 0xC0) << 8) | (value % 0xC0)
                 code += 0x8140 if code < 0x1F00 else 0xC140
-                raw += code.to_bytes(2, 'big')
-            parts.append(bytes(raw).decode('shift_jis', errors='replace'))
+                kanji += code.to_bytes(2, 'big')
+            parts.append(bytes(kanji).decode('shift_jis', errors='replace'))
             modes.append('kanji')
 
         elif mode == MODE_ECI:

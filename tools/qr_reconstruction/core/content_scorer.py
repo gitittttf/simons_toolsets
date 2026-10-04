@@ -10,7 +10,6 @@ basierend auf:
 
 import logging
 import re
-import os
 from dataclasses import dataclass
 from typing import List, Set, Tuple, Optional
 from pathlib import Path
