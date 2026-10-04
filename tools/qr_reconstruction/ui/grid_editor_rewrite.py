@@ -1,7 +1,11 @@
+from collections.abc import Callable
+from typing import Optional, Set, Tuple  # noqa: UP035
+
 import customtkinter as ctk
-from typing import Callable, Optional, Set, Tuple
 import numpy as np
-from ..core.qr_matrix import QRMatrix, CellState
+
+from ..core.qr_matrix import CellState, QRMatrix
+
 
 # ... Colors class (Same as before) ...
 class Colors:
