@@ -66,6 +66,11 @@ class SolvabilityReport:
     # Für das Overlay: je Modul der Block-Index (-1 = kein Datenmodul) und ob sein Codewort unbekannte Bits hat
     module_block: Optional[np.ndarray] = None
     module_affected: Optional[np.ndarray] = None
+    # Für den Inspektor: je Modul Index in der übertragenen Codewort-Folge (-1 = kein Datenmodul) und Bit (7 = MSB),
+    # je Codewort (Block, Position im Block, ist EC-Codewort)
+    module_codeword: Optional[np.ndarray] = None
+    module_bit: Optional[np.ndarray] = None
+    codeword_location: List[tuple] = field(default_factory=list)
     format_cells: List[tuple] = field(default_factory=list)
 
     @property
@@ -113,7 +118,14 @@ def _module_maps(matrix: QRMatrix, ec_level: str):
     np.logical_or.at(codeword_unknown, module_codeword, unknown_module)
     module_affected = np.zeros((matrix.size, matrix.size), dtype=bool)
     module_affected[rows, cols] = codeword_unknown[module_codeword]
-    return module_block, module_affected
+
+    codeword_map = np.full((matrix.size, matrix.size), -1, dtype=int)
+    codeword_map[rows, cols] = module_codeword
+    bit_map = np.full((matrix.size, matrix.size), -1, dtype=int)
+    bit_map[rows, cols] = 7 - np.arange(count) % 8
+    layout = block_layout(version, ec_level)
+    locations = [(b, pos, pos >= layout[b][0]) for b, pos in order]
+    return module_block, module_affected, codeword_map, bit_map, locations
 
 
 def analyze_solvability(matrix: QRMatrix, max_time: float = 0.5) -> SolvabilityReport:
@@ -153,10 +165,11 @@ def analyze_solvability(matrix: QRMatrix, max_time: float = 0.5) -> SolvabilityR
         assert first is not None  # es gibt immer mindestens einen Format-Kandidaten
         fmt, statuses = first
 
-    module_block, module_affected = _module_maps(matrix, fmt.ec_level)
+    module_block, module_affected, module_codeword, module_bit, locations = _module_maps(matrix, fmt.ec_level)
     report = SolvabilityReport(
         verdict='', message='', unknown_cells=unknown_cells, format=fmt, viable_formats=len(viable),
         blocks=statuses, module_block=module_block, module_affected=module_affected,
+        module_codeword=module_codeword, module_bit=module_bit, codeword_location=locations,
         format_cells=format_cells,
     )
 

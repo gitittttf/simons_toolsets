@@ -42,10 +42,15 @@ Nicht `main_window.py` direkt starten – die relativen Imports funktionieren nu
 4. **Lösbarkeit prüfen:** Die Sidebar zeigt live, ob der Code eindeutig lösbar ist. Der Schalter
    *Overlay* färbt betroffene Codewörter nach ihrem RS-Block ein:
    grün = eindeutig, gelb = korrigiert, orange = mehrdeutig, rot = widersprüchlich, lila = Format-Info.
-5. **Wiederherstellen** starten. Findet die Reed-Solomon-Rekonstruktion nichts, bietet das Tool
+5. **Bekannter Textanfang** (optional, z. B. `https://`): hilft bei starkem Schaden enorm, siehe unten.
+6. **Wiederherstellen** starten. Findet die Reed-Solomon-Rekonstruktion nichts, bietet das Tool
    als Fallback einen Pixel-Bruteforce an.
+7. **Ergebnis:** Text kopieren, URL öffnen oder den reparierten Code als PNG/SVG speichern
+   (mit Ruhezone – direkt scanbar und druckbar).
 
-Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick.
+Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick, **Strg+Z / Strg+Y** für
+Rückgängig/Wiederholen. Die Statuszeile unter dem Raster zeigt zum Modul unter der Maus Codewort,
+RS-Block, Bitposition, ob es Daten oder Fehlerkorrektur ist, und den Bytewert (**Codewort-Inspektor**).
 
 ### Bild-Import
 
@@ -64,6 +69,20 @@ Zoom per Mausrad, verschieben mit Strg+Linksklick oder Mittelklick.
 Der Import braucht OpenCV (`opencv-python`, in den Requirements enthalten); ohne OpenCV läuft das Tool
 weiter, nur der Import ist dann nicht verfügbar.
 
+## Kommandozeile
+
+Ohne Oberfläche, z. B. für viele Bilder auf einmal:
+
+```bash
+python -m tools.qr_reconstruction foto.jpg
+python -m tools.qr_reconstruction foto.jpg --prefix https:// --save repariert.png
+python -m tools.qr_reconstruction *.png --save fix_{name}.svg --json
+python -m tools.qr_reconstruction kaputt.png --corners 52,45,343,52,352,345,44,350
+```
+
+`--corners` setzt die vier Ecken (x,y im Uhrzeigersinn), wenn die automatische Erkennung scheitert.
+Exit-Code: 0 = alles rekonstruiert, 1 = mindestens ein Bild ohne Lösung, 2 = Fehler.
+
 ## Wie es funktioniert
 
 1. **Format-Info:** Fehlerkorrektur-Level und Maske sind in 15 Bits (zweifach) kodiert; es gibt
@@ -76,7 +95,13 @@ weiter, nur der Import ist dann nicht verfügbar.
    klassischer Fehlerkorrektur (`reedsolo`) behoben.
 4. **Daten:** Der Bitstrom wird dekodiert (Numeric, Alphanumeric, Byte, Kanji, ECI). Bei mehreren
    möglichen Lösungen entscheiden Terminator/Padding und der Inhalt (URL, Wörterbuch).
-5. **Gegenprobe:** Die rekonstruierte Matrix wird neu gerendert und von pyzbar gelesen.
+5. **Struktur-Solver:** Bleibt die Lösung mehrdeutig, werden Annahmen über den Aufbau der Daten
+   durchprobiert: Modus (Byte/Alphanumerisch/Numerisch) und Länge legen Zeichenzähler, Terminator und
+   die Füllbytes `0xEC 0x11 …` bis zum Ende fest – bei kurzen Inhalten in großen Codes ist das ein
+   Großteil der Daten. Ein bekannter Textanfang legt weitere Bits fest. Jede Annahme liefert zusätzliche
+   bekannte Bits für das Gleichungssystem. Beispiel: 50 % Schaden in einem Version-2-M-Code sind ohne
+   Hinweis mehrdeutig (2^48 Lösungen), mit Textanfang `https://` eindeutig.
+6. **Gegenprobe:** Die rekonstruierte Matrix wird neu gerendert und von pyzbar gelesen.
 
 | Modul | Aufgabe |
 |---|---|
@@ -87,6 +112,8 @@ weiter, nur der Import ist dann nicht verfügbar.
 | `core/reconstructor.py` | Gesamte Pipeline |
 | `core/analysis.py` | Lösbarkeitsanalyse für den Editor |
 | `core/image_import.py` | Bild → Matrix (Ecken, Entzerren, Version, Abtasten) |
+| `core/structure.py` | Struktur-Annahmen (Modus, Länge, Füllbytes, Textanfang) |
+| `core/export.py` | Matrix → PNG/SVG mit Ruhezone |
 | `core/bruteforce.py` | Pixel-Bruteforce (Fallback) |
 | `core/validator.py`, `core/content_scorer.py` | Bewertung mit pyzbar und Inhalts-Score |
 
