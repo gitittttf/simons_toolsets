@@ -9,6 +9,7 @@ Features:
 
 import customtkinter as ctk
 from tkinter import messagebox
+import logging
 import queue
 import threading
 import sys
@@ -18,10 +19,31 @@ from .results_view import ResultsView
 from ..core.qr_matrix import QRMatrix, QR_VERSIONS, get_version_for_size
 from ..core.bruteforce import BruteforceEngine
 from ..core.reconstructor import Reconstructor
+from ..core.analysis import (
+    VERDICT_AMBIGUOUS, VERDICT_COMPLETE, VERDICT_CORRECTABLE, VERDICT_INCONSISTENT, VERDICT_UNIQUE,
+    BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, analyze_solvability,
+)
 from ..core.validator import QRValidator
 
 
 from .theme import Colors, Fonts, Dimensions
+logger = logging.getLogger(__name__)
+
+# Anzeige des Analyse-Ergebnisses: Text und Farbe je Urteil
+VERDICT_DISPLAY = {
+    VERDICT_COMPLETE: ("✓ Vollständig", Colors.SUCCESS),
+    VERDICT_UNIQUE: ("✓ Eindeutig lösbar", Colors.SUCCESS),
+    VERDICT_CORRECTABLE: ("⚠ Lösbar mit Korrektur", Colors.WARNING),
+    VERDICT_AMBIGUOUS: ("⚠ Mehrdeutig", Colors.WARNING),
+    VERDICT_INCONSISTENT: ("✗ Nicht lösbar", Colors.ERROR),
+}
+BLOCK_STATUS_NAMES = {
+    BLOCK_OK: "ok", BLOCK_CORRECTED: "korrigiert", BLOCK_AMBIGUOUS: "mehrdeutig", BLOCK_UNSOLVABLE: "widersprüchlich",
+}
+# Wartezeit nach der letzten Änderung, bevor die Lösbarkeit neu analysiert wird
+ANALYSIS_DEBOUNCE_MS = 250
+
+
 def setup_theme():
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
@@ -55,6 +77,13 @@ class MainWindowMixin:
         self.grid_editor: Optional[GridEditor] = None
         self.editor_controls = None
         self.results_view: Optional[ResultsView] = None
+        
+        # Lösbarkeitsanalyse (läuft entprellt im Hintergrund)
+        self.overlay_on = False
+        self._analysis_after = None
+        self._analysis_generation = 0
+        self._analysis_queue: queue.Queue = queue.Queue()
+        self._analysis_polling = False
 
         self._build_start_screen()
 
@@ -268,13 +297,13 @@ class MainWindowMixin:
         self.grid_editor.on_cell_changed = on_change
         
         # 2. Sidebar (Right) - Fixed width
-        sidebar = ctk.CTkFrame(main, fg_color=Colors.BG_CARD, width=320, corner_radius=Dimensions.CORNER_RADIUS_NONE)
+        # Scrollbar, damit bei kleinen Fenstern nichts abgeschnitten wird
+        sidebar = ctk.CTkScrollableFrame(main, fg_color=Colors.BG_CARD, width=310, corner_radius=Dimensions.CORNER_RADIUS_NONE)
         sidebar.pack(fill="y", side="right")
-        sidebar.pack_propagate(False) # Fixed width
         
         # Sidebar Content
         ctk.CTkLabel(sidebar, text="QR Rekonstruktion", font=Fonts.HEADING, text_color=Colors.TEXT_PRIMARY).pack(pady=(20, 5), padx=20, anchor="w")
-        ctk.CTkLabel(sidebar, text=f"Version {self.matrix.size}x{self.matrix.size}", font=Fonts.BODY, text_color=Colors.TEXT_MUTED).pack(pady=(0, 20), padx=20, anchor="w")
+        ctk.CTkLabel(sidebar, text=f"Version {self.matrix.version} ({self.matrix.size}×{self.matrix.size})", font=Fonts.BODY, text_color=Colors.TEXT_MUTED).pack(pady=(0, 20), padx=20, anchor="w")
         
         # Stats Panel
         self.stats_labels = {}
@@ -309,7 +338,7 @@ class MainWindowMixin:
         stats_frame = ctk.CTkFrame(parent, fg_color="transparent")
         stats_frame.pack(fill="x", padx=20)
         
-        items = ["Unbekannt", "Kombinationen", "Zeit"]
+        items = ["Unbekannte Pixel", "Format", "Lösbarkeit"]
         for item in items:
             row = ctk.CTkFrame(stats_frame, fg_color="transparent")
             row.pack(fill="x", pady=2)
@@ -317,6 +346,39 @@ class MainWindowMixin:
             lbl = ctk.CTkLabel(row, text="-", font=Fonts.BODY_BOLD, text_color=Colors.TEXT_PRIMARY)
             lbl.pack(side="right")
             self.stats_labels[item] = lbl
+        
+        self.analysis_message = ctk.CTkLabel(
+            stats_frame, text="", font=Fonts.SMALL, text_color=Colors.TEXT_SECONDARY,
+            wraplength=270, justify="left", anchor="w")
+        self.analysis_message.pack(fill="x", pady=(6, 0))
+        self.analysis_blocks = ctk.CTkLabel(
+            stats_frame, text="", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED,
+            wraplength=270, justify="left", anchor="w")
+        self.analysis_blocks.pack(fill="x", pady=(2, 0))
+        
+        # Overlay-Schalter + Legende
+        overlay_var = ctk.BooleanVar(value=self.overlay_on)
+        
+        def toggle_overlay():
+            self.overlay_on = overlay_var.get()
+            self.grid_editor.overlay_enabled = self.overlay_on
+            self.grid_editor.render()
+        
+        ctk.CTkSwitch(
+            stats_frame, text="Overlay: Blöcke & Format-Info", variable=overlay_var,
+            command=toggle_overlay, font=Fonts.SMALL, text_color=Colors.TEXT_PRIMARY,
+            progress_color=Colors.ACCENT,
+        ).pack(anchor="w", pady=(10, 2))
+        legend = ctk.CTkFrame(stats_frame, fg_color="transparent")
+        legend.pack(fill="x")
+        entries = [(Colors.OVERLAY_OK, "eindeutig"), (Colors.OVERLAY_CORRECTED, "korrigiert"),
+                   (Colors.OVERLAY_AMBIGUOUS, "mehrdeutig"), (Colors.OVERLAY_UNSOLVABLE, "widersprüchlich"),
+                   (Colors.OVERLAY_FORMAT, "Format-Info")]
+        for i, (color, text) in enumerate(entries):
+            item = ctk.CTkFrame(legend, fg_color="transparent")
+            item.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 8))
+            ctk.CTkLabel(item, text="■", font=Fonts.SMALL, text_color=color, width=10).pack(side="left")
+            ctk.CTkLabel(item, text=text, font=("Segoe UI", 9), text_color=Colors.TEXT_MUTED).pack(side="left")
 
     def _build_sidebar_controls(self, parent):
         ctk.CTkLabel(parent, text="Werkzeuge", font=Fonts.SUBHEADING, text_color=Colors.TEXT_PRIMARY).pack(padx=20, anchor="w", pady=(0, 10))
@@ -326,30 +388,28 @@ class MainWindowMixin:
         btn_grid.pack(fill="x", padx=15)
         
         def reset():
+            # Alles außer den festen Mustern wird unbekannt, Farben werden verworfen
             self.matrix.reset()
-            self.grid_editor._init_cells_white()
             self.grid_editor.render()
             self._update_stats_sidebar()
             
-        def all_white():
-            import numpy as np
+        def unknown_to_white():
+            # Nützlich nach dem Abmalen nur der schwarzen Pixel: Rest als bekannt-weiß übernehmen
             from ..core.qr_matrix import CellState
-            # Set unlocked to white
             mask = ~self.matrix.locked
             self.matrix.grid[mask] = CellState.WHITE
+            self.matrix.locked[mask] = True
             self.grid_editor.render()
             self._update_stats_sidebar()
             
-        def unlock_all():
-            # Unlock un-fixed
-            for r in range(self.matrix.size):
-                for c in range(self.matrix.size):
-                    if not self.matrix._is_fixed_pattern(r, c):
-                        self.matrix.locked[r, c] = False
+        def all_unknown():
+            # Farben bleiben erhalten, alle nicht festen Pixel gelten als unbekannt
+            self.matrix.locked[~self.matrix.fixed] = False
             self.grid_editor.render()
             self._update_stats_sidebar()
             
-        btns = [("Reset", reset), ("Alles Weiß", all_white), ("Unlock All", unlock_all)]
+        btns = [("Reset (alles leeren)", reset), ("Unbekannte → Weiß", unknown_to_white),
+                ("Alles als unbekannt markieren", all_unknown)]
         for txt, cmd in btns:
             ctk.CTkButton(
                 btn_grid, text=txt, command=cmd,
@@ -360,7 +420,8 @@ class MainWindowMixin:
         
         # Hints
         ctk.CTkLabel(parent, text="Steuerung:", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(padx=20, anchor="w", pady=(20, 5))
-        hints = ["Linksklick: Malen", "Rechtsklick: Sperren", "Scroll: Zoom", "Ctrl+Klick: Bewegen"]
+        hints = ["Linksklick: Schwarz/Weiß malen (= bekannt)", "Rechtsklick: unbekannt markieren / zurück",
+                 "Scroll: Zoom", "Strg+Klick oder Mittelklick: Bewegen"]
         for h in hints:
              ctk.CTkLabel(parent, text=f"• {h}", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(padx=25, anchor="w")
 
@@ -383,7 +444,7 @@ class MainWindowMixin:
         self.mode_menu.pack(padx=20, fill="x")
         
         # Descriptions
-        self.mode_desc = ctk.CTkLabel(parent, text="Schnelltest (1k Versuche, 30s)", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED, wraplength=280, justify="left")
+        self.mode_desc = ctk.CTkLabel(parent, text="Reed-Solomon-Rekonstruktion (max. 30s).\nFallback-Bruteforce: max. 1.000 Versuche.", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED, wraplength=280, justify="left")
         self.mode_desc.pack(padx=20, pady=(5,0), anchor="w")
         
         # Custom Inputs Container (Hidden by default)
@@ -422,10 +483,10 @@ class MainWindowMixin:
         
     def _on_mode_change_sidebar(self, choice):
         if choice == "fast":
-            self.mode_desc.configure(text="Schnelltest für kleine Fehler.\nMax 1.000 Versuche oder 30s.")
+            self.mode_desc.configure(text="Reed-Solomon-Rekonstruktion (max. 30s).\nFallback-Bruteforce: max. 1.000 Versuche.")
             self.custom_inputs.pack_forget()
         elif choice == "accurate":
-            self.mode_desc.configure(text="Tiefensuche für bis zu ~15 fehlende Pixel.\nMax 50.000 Versuche oder 120s.")
+            self.mode_desc.configure(text="Reed-Solomon-Rekonstruktion (max. 120s).\nFallback-Bruteforce: max. 50.000 Versuche.")
             self.custom_inputs.pack_forget()
         elif choice == "custom":
             self.mode_desc.configure(text="Benutzerdefinierte Limits.\nLeerlassen = Keine Grenze.")
@@ -433,35 +494,90 @@ class MainWindowMixin:
 
 
     def _update_stats_sidebar(self):
-        if not hasattr(self, 'stats_labels'): return
+        if not hasattr(self, 'stats_labels') or not self.stats_labels:
+            return
+        unknown = int((~self.matrix.locked).sum())
+        self.stats_labels["Unbekannte Pixel"].configure(text=str(unknown))
+        self._schedule_analysis()
+
+    def _schedule_analysis(self):
+        """Analyse erst nach einer kurzen Pause starten, nicht bei jedem gemalten Pixel"""
+        if self._analysis_after is not None:
+            self.after_cancel(self._analysis_after)
+        self.stats_labels["Lösbarkeit"].configure(text="…", text_color=Colors.TEXT_MUTED)
+        self._analysis_after = self.after(ANALYSIS_DEBOUNCE_MS, self._start_analysis)
+
+    def _start_analysis(self):
+        self._analysis_after = None
+        self._analysis_generation += 1
+        generation = self._analysis_generation
+        snapshot = self.matrix.clone()  # der Thread arbeitet nie auf der Matrix, die gerade bemalt wird
+        results = self._analysis_queue
+
+        def work():
+            try:
+                report = analyze_solvability(snapshot)
+            except Exception:
+                logger.exception("Lösbarkeitsanalyse fehlgeschlagen")
+                report = None
+            results.put((generation, report))
+
+        threading.Thread(target=work, daemon=True).start()
+        if not self._analysis_polling:
+            self._analysis_polling = True
+            self.after(30, self._poll_analysis)
+
+    def _poll_analysis(self):
+        """Einzige Poll-Schleife: wartet auf das Ergebnis der neuesten Analyse, ältere werden verworfen"""
+        found, current = False, None
+        try:
+            while True:
+                generation, report = self._analysis_queue.get_nowait()
+                if generation == self._analysis_generation:
+                    found, current = True, report
+                    break
+        except queue.Empty:
+            pass
+        if not found and self.winfo_exists():
+            self.after(30, self._poll_analysis)
+            return
+        self._analysis_polling = False
+        self._show_analysis(current)
+
+    def _show_analysis(self, report):
+        labels = getattr(self, 'stats_labels', None)
+        if not labels or not labels["Lösbarkeit"].winfo_exists():
+            return  # Editor wurde inzwischen verlassen
+        if report is None:
+            labels["Lösbarkeit"].configure(text="Fehler", text_color=Colors.ERROR)
+            return
         
-        import numpy as np
-        total = self.matrix.size * self.matrix.size
-        locked = int(np.sum(self.matrix.locked))
-        unknown = total - locked
+        text, color = VERDICT_DISPLAY[report.verdict]
+        labels["Lösbarkeit"].configure(text=text, text_color=color)
+        fmt = report.format
+        fmt_text = f"{fmt.ec_level} / Maske {fmt.mask}"
+        if fmt.known_bits == 0:
+            fmt_text += " (geraten)"
+        elif fmt.mismatches:
+            fmt_text += f" ({fmt.mismatches} Bit abweichend)"
+        labels["Format"].configure(text=fmt_text)
+        self.analysis_message.configure(text=report.message)
         
-        self.stats_labels["Unbekannt"].configure(text=str(unknown))
-        
-        if unknown <= 63:
-            combos = f"2^{unknown}" if unknown > 20 else f"{2**unknown:,}"
+        # Blöcke: bei wenigen einzeln auflisten, sonst zusammenfassen
+        if len(report.blocks) <= 4:
+            lines = [f"Block {b.index + 1}: {b.unknown_codewords}/{b.nsym} Codewörter unbekannt "
+                     f"– {BLOCK_STATUS_NAMES[b.status]}" for b in report.blocks]
         else:
-            combos = f"2^{unknown}"
-        self.stats_labels["Kombinationen"].configure(text=combos)
+            counts = {}
+            for b in report.blocks:
+                counts[b.status] = counts.get(b.status, 0) + 1
+            lines = [f"{len(report.blocks)} Blöcke: " + ", ".join(
+                f"{n} {BLOCK_STATUS_NAMES[status]}" for status, n in counts.items())]
+        lines.append("(unbekannte Codewörter / EC-Codewörter je Block)")
+        self.analysis_blocks.configure(text="\n".join(lines))
         
-        # Est Time
-        if unknown > 25:
-             t = "∞"
-        elif unknown == 0:
-             t = "0s"
-        else:
-             # Rough est
-             tests = 2**unknown
-             secs = tests / 2000 # Assume 2k/sec
-             if secs < 60: t = f"{secs:.1f}s"
-             elif secs < 3600: t = f"{secs/60:.1f}m"
-             else: t = f"{secs/3600:.1f}h"
-             
-        self.stats_labels["Zeit"].configure(text=t)
+        if self.grid_editor is not None and self.grid_editor.winfo_exists():
+            self.grid_editor.set_overlay(report, enabled=self.overlay_on)
 
     # _build_config and _build_action_bar are replaced by sidebar methods
     # We remove them implicitly by overwriting _build_editor_view which called them.
@@ -636,7 +752,8 @@ class MainWindowMixin:
         # Shadow line
         ctk.CTkFrame(main, fg_color="#d1d5db", height=1).pack(fill="x")
         
-        ctk.CTkLabel(header, text="✨ Rekonstruktion läuft...", font=Fonts.HEADING, text_color=Colors.TEXT_PRIMARY).pack(side="left", padx=20, pady=10)
+        self.header_title = ctk.CTkLabel(header, text="✨ Rekonstruktion läuft...", font=Fonts.HEADING, text_color=Colors.TEXT_PRIMARY)
+        self.header_title.pack(side="left", padx=20, pady=10)
         
         self.progress_label = ctk.CTkLabel(header, text="0 / 0", font=Fonts.BODY, text_color=Colors.TEXT_PRIMARY)
         self.progress_label.pack(side="left", padx=20)
@@ -677,6 +794,7 @@ class MainWindowMixin:
 
     def _on_complete(self, results):
         self.is_running = False
+        self.header_title.configure(text="✨ Rekonstruktion abgeschlossen" if results else "Keine Lösung gefunden")
         self.progress_bar.stop()
         self.progress_bar.pack_forget()
         self.btn_stop.configure(state="normal", text="✓ Fertig", command=self._back, fg_color=Colors.SUCCESS, text_color="#ffffff", hover_color="#2e8b57")

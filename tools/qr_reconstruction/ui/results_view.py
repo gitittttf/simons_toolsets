@@ -268,7 +268,18 @@ class ResultsView(ctk.CTkFrame):
             font=("Segoe UI", 18, "bold"),
             text_color=Colors.ACCENT
         )
-        self.confidence_label.pack(pady=(0, 10))
+        self.confidence_label.pack(pady=(0, 2))
+        
+        # Herkunft der Lösung (Reed-Solomon: EC-Level, Maske, Korrekturen, Mehrdeutigkeit)
+        self.method_label = ctk.CTkLabel(
+            self.confidence_frame,
+            text="",
+            font=("Segoe UI", 11),
+            text_color=Colors.TEXT_SECONDARY,
+            wraplength=300,
+            justify="center"
+        )
+        self.method_label.pack(pady=(0, 10))
         
         # Score Breakdown
         self.scores_frame = ctk.CTkFrame(
@@ -436,12 +447,17 @@ class ResultsView(ctk.CTkFrame):
         # Confidence
         conf_value = result.confidence / 100.0
         self.confidence_bar.set(conf_value)
-        label = f"{result.confidence:.1f}%"
+        self.confidence_label.configure(text=f"{result.confidence:.1f}%")
         if result.method == "rs":
-            label += f"  ·  Reed-Solomon ({result.error_correction_level}, Maske {result.mask_pattern})"
+            info = (f"Reed-Solomon · EC-Level {result.error_correction_level} · Maske {result.mask_pattern}\n"
+                    f"{result.unknown_codewords} Codewörter rekonstruiert")
+            if result.corrected_errors:
+                info += f", {result.corrected_errors} falsch abgemalte korrigiert"
             if result.ambiguous_bits:
-                label += f"  ·  mehrdeutig (2^{result.ambiguous_bits})"
-        self.confidence_label.configure(text=label)
+                info += f"\nMehrdeutig: 2^{result.ambiguous_bits} mögliche Lösungen"
+        else:
+            info = "Pixel-Bruteforce"
+        self.method_label.configure(text=info)
         
         # Farbe basierend auf Confidence
         if result.confidence >= 70:
