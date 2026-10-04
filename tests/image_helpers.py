@@ -13,7 +13,8 @@ def code_image(text, version=None, ec='M', box=12, border=4):
     qr.add_data(text)
     qr.make(fit=version is None)
     gray = np.array(qr.make_image(fill_color="black", back_color="white").convert('L'))
-    matrix = np.array(qr.get_matrix(), dtype=int)[border:-border, border:-border]
+    full = np.array(qr.get_matrix(), dtype=int)
+    matrix = full[border:len(full) - border, border:len(full) - border]
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), matrix
 
 

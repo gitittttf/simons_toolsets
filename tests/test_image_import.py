@@ -111,6 +111,31 @@ def test_user_sample_image():
     assert results[0].ambiguous_bits == 0
 
 
+@pytest.mark.parametrize('version,text', [(1, 'HELLO'), (2, URL), (7, URL)])
+def test_borderless_image(version, text):
+    """Code reicht bis an den Bildrand (Screenshot/Export ohne Ruhezone): OpenCV fand dort falsche Ecken"""
+    image, truth = code_image(text, version=version, box=20, border=0)
+    corners = image_import.detect_corners(image)
+    side = image.shape[0]
+    # Die Ecke ohne Finder-Pattern schätzt OpenCV auf etwa ein halbes Modul genau (die Verfeinerung gleicht das aus)
+    assert np.abs(corners - np.array([[0, 0], [side, 0], [side, side], [0, side]])).max() < 20
+    result = image_import.sample_grid(image, corners)
+    assert result.size == truth.shape[0] and result.pattern_score == pytest.approx(1.0)
+    assert Reconstructor(result.to_matrix()).run(max_time=10)[0].decoded_data == text
+
+
+def test_user_borderless_sample_image():
+    """Vom Nutzer beigesteuert: randloser Export des reparierten Codes - wurde als Version 10 erkannt"""
+    from pathlib import Path
+    path = Path(__file__).parent.parent / "test_qr_code_obstructed_fixed.png"
+    if not path.exists():
+        pytest.skip("Beispielbild fehlt")
+    image = image_import.load_image(str(path))
+    result = image_import.sample_grid(image, image_import.detect_corners(image))
+    assert result.size == 25
+    assert Reconstructor(result.to_matrix()).run(max_time=10)[0].decoded_data == 'https://aniworld.to/'
+
+
 def test_to_matrix_keeps_fixed_patterns_and_marks_unsure():
     image, _ = code_image(URL)
     result = image_import.sample_grid(image, image_import.detect_corners(image))

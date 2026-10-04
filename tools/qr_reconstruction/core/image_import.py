@@ -84,8 +84,7 @@ def load_image(path: str) -> np.ndarray:
     return image
 
 
-def detect_corners(image: np.ndarray) -> Optional[np.ndarray]:
-    """Ecken des QR-Codes (4×2) oder None, wenn OpenCV keinen Code findet"""
+def _detect(image: np.ndarray) -> Optional[np.ndarray]:
     cv2 = _cv2()
     detectors = [cv2.QRCodeDetector()]
     if hasattr(cv2, 'QRCodeDetectorAruco'):
@@ -98,6 +97,31 @@ def detect_corners(image: np.ndarray) -> Optional[np.ndarray]:
         if found and points is not None:
             return np.asarray(points, dtype=np.float32).reshape(4, 2)
     return None
+
+
+def detect_corners(image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Ecken des QR-Codes (4×2) oder None, wenn OpenCV keinen Code findet.
+
+    Gesucht wird im Originalbild und in einer Kopie mit weißem Rahmen: Bei randlos zugeschnittenen Codes
+    (Screenshot, Export ohne Ruhezone) findet OpenCV im Original falsche Ecken, bei Fotos mit Hintergrund
+    sind dagegen die Ecken aus dem Original genauer. Weichen beide ab, entscheidet ein Probe-Abtasten,
+    welche besser zu den festen Mustern passen.
+    """
+    cv2 = _cv2()
+    pad = max(20, int(max(image.shape[:2]) * 0.1))
+    white = (255, 255, 255) if image.ndim == 3 else 255
+    padded = _detect(cv2.copyMakeBorder(image, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=white))
+    original = _detect(image)
+    if padded is not None:
+        padded -= pad
+    if original is None or padded is None:
+        return original if original is not None else padded
+    side = max(np.ptp(original[:, 0]), np.ptp(original[:, 1]), 1.0)
+    if np.abs(original - padded).max() < side * 0.03:
+        return original
+    scores = [sample_grid(image, corners, refine=False).pattern_score for corners in (original, padded)]
+    return original if scores[0] >= scores[1] else padded
 
 
 def default_corners(image: np.ndarray) -> np.ndarray:

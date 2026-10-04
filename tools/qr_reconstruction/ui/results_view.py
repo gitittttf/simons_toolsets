@@ -597,7 +597,7 @@ class ResultsView(ctk.CTkFrame):
         ctk.CTkButton(
             btn_frame, 
             text="💾 Speichern", 
-            command=lambda: self._save_preview_image(self.current_raw_image),
+            command=self._save_code,
             fg_color=Colors.ACCENT,
             hover_color=Colors.ACCENT_HOVER,
             width=140
@@ -654,19 +654,6 @@ class ResultsView(ctk.CTkFrame):
             logger.exception("Speichern fehlgeschlagen")
             messagebox.showerror("Speichern fehlgeschlagen", str(e), parent=self.winfo_toplevel())
 
-    def _save_preview_image(self, img):
-        from tkinter import filedialog
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG Image", "*.png")],
-            title="QR-Code speichern"
-        )
-        if path:
-            # Scale up for saving (high quality)
-            # Size 1000px is good
-            large = img.resize((1000, 1000), Image.Resampling.NEAREST)
-            large.save(path)
-    
     def _on_export(self):
         """Exportiert Ergebnisse"""
         if not self.results:

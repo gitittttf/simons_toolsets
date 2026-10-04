@@ -74,6 +74,8 @@ def _print_entry(entry: dict):
         return
     print(f"  Version {entry['version']}, feste Muster {entry['pattern_score']:.0%}, "
           f"{entry['unknown_modules']} Module unbekannt")
+    if entry['pattern_score'] < 0.85:
+        print("  ⚠ Die festen Muster passen schlecht - vermutlich sitzen die Ecken falsch (--corners angeben)")
     if not entry['results']:
         print("  ✗ Keine Lösung gefunden")
     for i, r in enumerate(entry['results'], start=1):
