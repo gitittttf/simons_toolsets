@@ -1,6 +1,5 @@
 import random
 
-import numpy as np
 import pytest
 import qrcode.util
 

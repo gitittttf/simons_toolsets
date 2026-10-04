@@ -1,0 +1,2 @@
+-r tools/qr_reconstruction/requirements.txt
+pytest>=8.0

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from PIL import Image
 import os
 from .qr_matrix import QRMatrix, CellState
-from .content_scorer import ContentScorer, ContentScore, get_content_scorer
+from .content_scorer import get_content_scorer
 
 logger = logging.getLogger(__name__)
 

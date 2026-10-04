@@ -16,7 +16,7 @@ import sys
 from typing import Optional
 from .grid_editor import GridEditor
 from .results_view import ResultsView
-from ..core.qr_matrix import QRMatrix, QR_VERSIONS, get_version_for_size
+from ..core.qr_matrix import QRMatrix, QR_VERSIONS
 from ..core.bruteforce import BruteforceEngine
 from ..core.reconstructor import Reconstructor
 from ..core.analysis import (
@@ -579,47 +579,6 @@ class MainWindowMixin:
         if self.grid_editor is not None and self.grid_editor.winfo_exists():
             self.grid_editor.set_overlay(report, enabled=self.overlay_on)
 
-    # _build_config and _build_action_bar are replaced by sidebar methods
-    # We remove them implicitly by overwriting _build_editor_view which called them.
-    # But we need to make sure _start_bruteforce still works (it uses self.iter_entry which is gone).
-    # We simplified mode selection to just Dropdown.
-    # We need to update _start_bruteforce to not crash on missing widgets.
-
-    
-    def _build_action_bar(self, parent):
-        """Action Bar"""
-        bar = ctk.CTkFrame(parent, fg_color=Colors.BG_SECONDARY, height=70, corner_radius=Dimensions.CORNER_RADIUS_NONE)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-        
-        # Top border shadow
-        ctk.CTkFrame(bar, fg_color=Colors.BORDER, height=1).pack(fill="x", side="top")
-        
-        # Start Button
-        self.btn_start = ctk.CTkButton(
-            bar,
-            text="✨ Rekonstruktion starten",
-            command=self._start_bruteforce,
-            width=240,
-            height=40,
-            font=Fonts.BUTTON_LARGE,
-            fg_color=Colors.ACCENT,
-            text_color="#ffffff",
-            hover_color=Colors.ACCENT_HOVER,
-            corner_radius=Dimensions.CORNER_RADIUS_L
-        )
-        self.btn_start.pack(side="right", padx=20, pady=15)
-        
-        # Quick Stats
-        self.quick_stats = ctk.CTkLabel(bar, text="", font=Fonts.BODY, text_color=Colors.TEXT_PRIMARY)
-        self.quick_stats.pack(side="left", padx=30, pady=15)
-        self._update_quick_stats()
-    
-    def _update_quick_stats(self):
-        if self.matrix and hasattr(self, 'quick_stats'):
-            stats = self.matrix.get_stats()
-            self.quick_stats.configure(text=f"📊 Version {stats['version']}  •  {stats['unknown_cells']} Unbekannte Zellen")
-            
     def _start_bruteforce(self):
         """Rekonstruktion starten: erst Reed-Solomon, Pixel-Bruteforce nur als Fallback"""
         stats = self.matrix.get_stats()

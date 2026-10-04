@@ -1,7 +1,9 @@
+import logging
+
 from core.base_tool import BaseTool
-from .ui.main_window import MainWindow
-import sys
-import os
+
+logger = logging.getLogger(__name__)
+
 
 class QRReconstructionTool(BaseTool):
     @property
@@ -10,33 +12,30 @@ class QRReconstructionTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Rekonstruiert unvollständige QR-Codes durch Bruteforcing"
+        return "Rekonstruiert beschädigte QR-Codes per Reed-Solomon-Fehlerkorrektur"
 
     @property
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def run(self):
-        """Startet die das Tool als Standalone"""
+        """Startet das Tool als Standalone"""
         from .ui.main_window import MainWindow
         app = MainWindow(is_standalone=True)
         app.mainloop()
 
     def launch_gui(self, parent):
-        """Startet die GUI vom Hub aus"""
+        """Startet die GUI vom Hub aus (eigenes Toplevel-Fenster am Hub-Root)"""
         from .ui.main_window import MainWindowToplevel
-        # Wir nutzten jetzt ein echtes Toplevel-Fenster, das am Hub-Root hängt
         self.window = MainWindowToplevel()
         return self.window
 
     def cleanup(self):
-        """Stoppt Hintergrund-Prozesse"""
-        if hasattr(self, 'window') and self.window:
+        """Stoppt laufende Rekonstruktionen und schließt das Fenster"""
+        if getattr(self, 'window', None):
             if getattr(self.window, 'active_job', None):
                 self.window.active_job.stop()
             try:
                 self.window.destroy()
-            except Exception as e:
-                # Ignore errors if window is already destroyed
-                print(f"Cleanup note: {e}")
-                pass
+            except Exception as e:  # Fenster kann bereits zerstört sein
+                logger.debug("Cleanup: %s", e)

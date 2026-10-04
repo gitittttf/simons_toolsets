@@ -6,3 +6,4 @@ test_output/
 .idea/
 *.egg-info/
 .pytest_cache/
+.mypy_cache/

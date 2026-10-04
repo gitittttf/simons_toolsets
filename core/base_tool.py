@@ -1,6 +1,4 @@
 from abc import ABC, abstractmethod
-import tkinter as tk
-from typing import Optional
 
 class BaseTool(ABC):
     """

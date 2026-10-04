@@ -8,7 +8,7 @@ from tools.qr_reconstruction.core import codewords as cw
 from tools.qr_reconstruction.core.reconstructor import Reconstructor, rank_formats
 from tools.qr_reconstruction.core.spec import block_layout, format_info_positions
 from tools.qr_reconstruction.core.validator import QRValidator
-from tests.helpers import damage, make_known_matrix, make_qr_grid
+from tests.helpers import damage, make_known_matrix
 
 TEXT = 'https://www.github.com/simon'
 

@@ -10,7 +10,7 @@ Nutzt dieselben Bausteine wie der Reconstructor, aber ohne Lösungen aufzuzähle
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -131,14 +131,14 @@ def analyze_solvability(matrix: QRMatrix, max_time: float = 0.5) -> SolvabilityR
     best_mismatch = formats[0].mismatches
     candidates = [f for f in formats if f.mismatches == best_mismatch]
 
-    viable = []
-    first_statuses = None
+    viable: List[Tuple[FormatCandidate, List[BlockStatus]]] = []
+    first: Optional[Tuple[FormatCandidate, List[BlockStatus]]] = None
     for fmt in candidates:
         if viable and time.time() > deadline:
             break
         statuses = _analyze_format(matrix, fmt)
-        if first_statuses is None:
-            first_statuses = (fmt, statuses)
+        if first is None:
+            first = (fmt, statuses)
         if all(s.free_bits is not None for s in statuses):
             viable.append((fmt, statuses))
 
@@ -146,11 +146,12 @@ def analyze_solvability(matrix: QRMatrix, max_time: float = 0.5) -> SolvabilityR
         # Bestes Format: wenigste Freiheitsgrade, dann wenigste Korrekturen, dann die meisten EC-Codewörter.
         # Letzteres, weil RS-Codes gleicher Länge verschachtelt sind: Ein gültiger Block mit 16 EC-Codewörtern
         # ist auch mit 10 gültig - das Format mit mehr bestandenen Prüfungen ist das plausiblere.
-        fmt, statuses = min(viable, key=lambda v: (sum(s.free_bits for s in v[1]),
+        fmt, statuses = min(viable, key=lambda v: (sum(s.free_bits or 0 for s in v[1]),
                                                    sum(s.corrected_errors for s in v[1]),
                                                    -sum(s.nsym for s in v[1])))
     else:
-        fmt, statuses = first_statuses
+        assert first is not None  # es gibt immer mindestens einen Format-Kandidaten
+        fmt, statuses = first
 
     module_block, module_affected = _module_maps(matrix, fmt.ec_level)
     report = SolvabilityReport(

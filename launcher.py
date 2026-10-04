@@ -4,12 +4,14 @@ import pkgutil
 import importlib
 import inspect
 import sys
-from typing import Dict, Type
-from PIL import Image, ImageTk
+import logging
+from typing import Dict
 
 # Fix imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.base_tool import BaseTool
+
+logger = logging.getLogger(__name__)
 
 # --- THEME CONFIG ---
 class HubColors:
@@ -106,9 +108,9 @@ class ToolHub(ctk.CTk):
                             # Instantiate
                             tool_instance = item_obj()
                             self.tools[tool_instance.name] = tool_instance
-                            print(f"Loaded: {tool_instance.name}")
+                            logger.info("Tool geladen: %s", tool_instance.name)
                 except Exception as e:
-                    print(f"Error loading {name}: {e}")
+                    logger.exception("Tool %s konnte nicht geladen werden: %s", name, e)
 
     def _render_tools(self):
         # Clear
@@ -165,7 +167,7 @@ class ToolHub(ctk.CTk):
     def _launch_app(self, tool):
         # Check if already running
         if tool.name in self.running_apps:
-            print(f"Restoring {tool.name}...")
+            logger.info("Stelle %s wieder her", tool.name)
             # Bring to front
             try:
                 # If minimized/hidden
@@ -174,11 +176,11 @@ class ToolHub(ctk.CTk):
                 tool.window.focus_force()
                 return
             except Exception as e:
-                print(f"Window was gone: {e}")
+                logger.info("Fenster von %s existiert nicht mehr: %s", tool.name, e)
                 del self.running_apps[tool.name]
         
         # Launch new
-        print(f"Launching {tool.name}...")
+        logger.info("Starte %s", tool.name)
         try:
             window = tool.launch_gui(self)
             
@@ -189,14 +191,12 @@ class ToolHub(ctk.CTk):
             self.running_apps[tool.name] = tool
             self._update_stats()
             
-        except Exception as e:
-            print(f"Failed to launch: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("%s konnte nicht gestartet werden", tool.name)
 
     def _minimize_app(self, tool):
         """Hides the app instead of closing it"""
-        print(f"Minimizing {tool.name}...")
+        logger.info("Minimiere %s", tool.name)
         tool.window.withdraw() # Hide
         
     def _update_stats(self):
@@ -205,15 +205,15 @@ class ToolHub(ctk.CTk):
 
     def _on_close(self):
         """Clean shutdown of Hub and all Apps"""
-        print("Shutting down Hub...")
+        logger.info("Hub wird beendet")
         
         for name, tool in self.running_apps.items():
             try:
-                print(f"Closing {name}...")
+                logger.info("Schließe %s", name)
                 tool.cleanup() # Stop threads
                 tool.window.destroy() # Destroy window
             except Exception as e:
-                print(f"Error closing {name}: {e}")
+                logger.exception("Fehler beim Schließen von %s: %s", name, e)
         
         self.destroy() # Close Hub
         sys.exit(0)

@@ -9,16 +9,18 @@ Features:
 - Export-Funktionalität
 """
 
+import logging
 import customtkinter as ctk
 from typing import List, Callable, Optional
-from tkinter import ttk
-import tkinter as tk
-from PIL import Image, ImageTk
+from tkinter import messagebox, ttk
+from PIL import Image
 import numpy as np
 from ..core.validator import ValidationResult
 
 
-from .theme import Colors, Fonts, Dimensions
+from .theme import Colors, Dimensions
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # THEME (Loaded from theme.py)
@@ -514,9 +516,9 @@ class ResultsView(ctk.CTkFrame):
             # Bind Click
             self.preview_label.bind("<Button-1>", self._on_preview_click)
             
-        except Exception as e:
-            print(f"Preview Error: {e}")
-            self.preview_label.configure(text=f"Vorschau-Fehler", image=None, cursor="")
+        except Exception:
+            logger.exception("Vorschau konnte nicht erzeugt werden")
+            self.preview_label.configure(text="Vorschau-Fehler", image=None, cursor="")
             self.preview_label.unbind("<Button-1>")
 
     def _on_preview_click(self, event):
@@ -628,6 +630,12 @@ class ResultsView(ctk.CTkFrame):
                         'confidence': float(result.confidence),
                         'content': result.decoded_data,
                         'is_url': result.is_url,
+                        'method': result.method,
+                        'error_correction_level': result.error_correction_level,
+                        'mask_pattern': result.mask_pattern,
+                        'unknown_codewords': result.unknown_codewords,
+                        'corrected_errors': result.corrected_errors,
+                        'ambiguous_bits': result.ambiguous_bits,
                         'structure_score': float(result.structure_score),
                         'pattern_score': float(result.pattern_score),
                         'density_score': float(result.density_score),
@@ -646,7 +654,7 @@ class ResultsView(ctk.CTkFrame):
                 import csv
                 with open(filename, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow(['Rank', 'Confidence', 'Is_URL', 'Content', 'Structure', 'Pattern', 'Density', 'Decode', 'Content_Score'])
+                    writer.writerow(['Rank', 'Confidence', 'Is_URL', 'Content', 'Method', 'Structure', 'Pattern', 'Density', 'Decode', 'Content_Score'])
                     
                     for i, result in enumerate(self.results):
                         writer.writerow([
@@ -654,6 +662,7 @@ class ResultsView(ctk.CTkFrame):
                             f"{result.confidence:.2f}",
                             result.is_url,
                             result.decoded_data or "",
+                            result.method,
                             f"{result.structure_score:.1f}",
                             f"{result.pattern_score:.1f}",
                             f"{result.density_score:.1f}",
@@ -661,10 +670,12 @@ class ResultsView(ctk.CTkFrame):
                             f"{result.content_score:.1f}"
                         ])
             
-            print(f"✓ Exportiert nach: {filename}")
+            logger.info("Exportiert nach %s", filename)
         
-        except Exception as e:
-            print(f"Export-Fehler: {e}")
+        except OSError as e:
+            logger.exception("Export fehlgeschlagen")
+            messagebox.showerror("Export fehlgeschlagen", f"Datei konnte nicht geschrieben werden:\n{e}",
+                                 parent=self.winfo_toplevel())
 
     def _show_score_help(self):
         """Zeigt Details zur Score-Berechnung"""

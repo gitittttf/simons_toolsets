@@ -10,7 +10,7 @@ import os
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Tuple, Callable, Optional, Dict
+from typing import Any, List, Tuple, Callable, Optional, Dict
 
 import numpy as np
 
@@ -80,7 +80,7 @@ class _CandidateTester:
 
 # Zustand pro Worker-Prozess (gesetzt durch _init_worker)
 _worker_tester: Optional[_CandidateTester] = None
-_worker_stop_event = None
+_worker_stop_event: Any = None  # multiprocessing.Event
 _worker_deadline: float = 0.0
 
 
@@ -102,6 +102,7 @@ def _worker_process(start: int, end: int) -> Tuple[int, List[ValidationResult]]:
     Returns:
         (Anzahl tatsächlich getesteter Kandidaten, gültige Ergebnisse)
     """
+    assert _worker_tester is not None and _worker_stop_event is not None, "Worker nicht initialisiert"
     results = []
     tested = 0
     for index in range(start, end):
@@ -116,21 +117,21 @@ def _worker_process(start: int, end: int) -> Tuple[int, List[ValidationResult]]:
 
 class BruteforceMode:
     """Vordefinierte Bruteforce-Modi"""
-    FAST = {
+    FAST: Dict[str, Any] = {
         'name': 'Schnell',
         'max_iterations': 1000,
         'max_time': 10,
         'parallel': True
     }
 
-    ACCURATE = {
+    ACCURATE: Dict[str, Any] = {
         'name': 'Akkurat',
         'max_iterations': 100000,
         'max_time': 300,
         'parallel': True
     }
 
-    CUSTOM = {
+    CUSTOM: Dict[str, Any] = {
         'name': 'Custom',
         'max_iterations': 10000,
         'max_time': 60,
@@ -149,7 +150,7 @@ class BruteforceEngine:
         self.validator = validator
         self.unknown_cells = matrix.get_unknown_cells()
 
-        self.stats = {
+        self.stats: Dict[str, Any] = {
             'tested': 0,
             'valid': 0,
             'start_time': None,
@@ -160,10 +161,10 @@ class BruteforceEngine:
         self.progress_callback: Optional[Callable] = None
         self.result_callback: Optional[Callable] = None
         self._should_stop = False
-        self._stop_event = None
+        self._stop_event: Any = None  # multiprocessing.Event während eines Laufs
         # Beste Lösung je dekodiertem Text (pyzbar korrigiert intern Fehler,
         # daher liefern viele Kandidaten denselben Inhalt)
-        self._results_by_data: Dict[str, ValidationResult] = {}
+        self._results_by_data: Dict[Optional[str], ValidationResult] = {}
 
     def stop(self):
         self._should_stop = True
@@ -204,6 +205,7 @@ class BruteforceEngine:
             'mode': mode
         }
 
+        config: Dict[str, Any]
         if mode == 'fast':
             config = BruteforceMode.FAST.copy()
         elif mode == 'accurate':
