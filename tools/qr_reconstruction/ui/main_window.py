@@ -21,6 +21,8 @@ from ..core.qr_matrix import QRMatrix, QR_VERSIONS
 from ..core.bruteforce import BruteforceEngine
 from ..core.reconstructor import Reconstructor
 from ..core import image_import
+from ..core.codewords import read_codewords
+from ..core.spec import format_info_positions, version_info_positions
 from ..core.analysis import (
     VERDICT_AMBIGUOUS, VERDICT_COMPLETE, VERDICT_CORRECTABLE, VERDICT_INCONSISTENT, VERDICT_UNIQUE,
     BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, analyze_solvability,
@@ -61,6 +63,8 @@ class MainWindowMixin:
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         setup_theme()
+        for sequence, action in (("<Control-z>", "undo"), ("<Control-y>", "redo"), ("<Control-Z>", "redo")):
+            self.bind(sequence, lambda event, a=action: self._editor_history(a))
 
         self.title("✨ QR-Code Rekonstruktion ✨")
         self.geometry("1550x980")
@@ -90,6 +94,8 @@ class MainWindowMixin:
         self._analysis_generation = 0
         self._analysis_queue: queue.Queue = queue.Queue()
         self._analysis_polling = False
+        self._last_report = None
+        self._inspect_cache = (None, None)
 
         self._build_start_screen()
 
@@ -385,8 +391,15 @@ class MainWindowMixin:
         canvas_container = ctk.CTkFrame(main, fg_color="#333333", corner_radius=Dimensions.CORNER_RADIUS_NONE)
         canvas_container.pack(fill="both", expand=True, side="left")
         
+        # Statuszeile für den Codewort-Inspektor
+        self.inspector_label = ctk.CTkLabel(
+            canvas_container, text="  Maus über ein Modul bewegen, um Codewort und Block zu sehen",
+            font=Fonts.SMALL, text_color="#cbd5e1", fg_color="#262626", anchor="w", height=26)
+        self.inspector_label.pack(side="bottom", fill="x")
+        
         self.grid_editor = GridEditor(canvas_container, self.matrix)
         self.grid_editor.pack(fill="both", expand=True)
+        self.grid_editor.on_hover = self._on_inspect
         if self.photo is not None:
             self.grid_editor.set_photo(self.photo, show=self.photo_on)
         
@@ -502,6 +515,7 @@ class MainWindowMixin:
         
         def reset():
             # Alles außer den festen Mustern wird unbekannt, Farben werden verworfen
+            self.grid_editor.push_undo()
             self.matrix.reset()
             self.grid_editor.render()
             self._update_stats_sidebar()
@@ -509,6 +523,7 @@ class MainWindowMixin:
         def unknown_to_white():
             # Nützlich nach dem Abmalen nur der schwarzen Pixel: Rest als bekannt-weiß übernehmen
             from ..core.qr_matrix import CellState
+            self.grid_editor.push_undo()
             mask = ~self.matrix.locked
             self.matrix.grid[mask] = CellState.WHITE
             self.matrix.locked[mask] = True
@@ -517,6 +532,7 @@ class MainWindowMixin:
             
         def all_unknown():
             # Farben bleiben erhalten, alle nicht festen Pixel gelten als unbekannt
+            self.grid_editor.push_undo()
             self.matrix.locked[~self.matrix.fixed] = False
             self.grid_editor.render()
             self._update_stats_sidebar()
@@ -534,7 +550,7 @@ class MainWindowMixin:
         # Hints
         ctk.CTkLabel(parent, text="Steuerung:", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(padx=20, anchor="w", pady=(20, 5))
         hints = ["Linksklick: Schwarz/Weiß malen (= bekannt)", "Rechtsklick: unbekannt markieren / zurück",
-                 "Scroll: Zoom", "Strg+Klick oder Mittelklick: Bewegen"]
+                 "Scroll: Zoom", "Strg+Klick oder Mittelklick: Bewegen", "Strg+Z / Strg+Y: Rückgängig / Wiederholen"]
         for h in hints:
              ctk.CTkLabel(parent, text=f"• {h}", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(padx=25, anchor="w")
 
@@ -582,6 +598,17 @@ class MainWindowMixin:
         ctk.CTkLabel(self.custom_inputs, text="* Stoppt wenn eines erreicht wird", font=("Segoe UI", 10), text_color=Colors.TEXT_MUTED).pack(anchor="w", pady=(2,0))
 
         
+        # Bekannter Textanfang: hilft bei mehrdeutigem Schaden (Struktur-Solver)
+        ctk.CTkLabel(parent, text="Bekannter Textanfang (optional)", font=Fonts.SMALL,
+                     text_color=Colors.TEXT_PRIMARY).pack(padx=20, anchor="w", pady=(12, 2))
+        self.prefix_entry = ctk.CTkEntry(parent, height=28, font=Fonts.BODY,
+                                         placeholder_text="z.B. https://")
+        self.prefix_entry.pack(padx=20, fill="x")
+        if getattr(self, 'known_prefix', ''):
+            self.prefix_entry.insert(0, self.known_prefix)
+        ctk.CTkLabel(parent, text="Hilft, wenn der Code zu stark beschädigt ist.", font=("Segoe UI", 10),
+                     text_color=Colors.TEXT_MUTED).pack(padx=20, anchor="w")
+
         self.btn_start = ctk.CTkButton(
             parent,
             text="✨ Wiederherstellen",
@@ -657,6 +684,58 @@ class MainWindowMixin:
         self._analysis_polling = False
         self._show_analysis(current)
 
+    def _editor_history(self, action: str):
+        """Strg+Z / Strg+Y - nur im Editor"""
+        editor = self.grid_editor
+        if editor is None or not editor.winfo_exists() or self.is_running:
+            return
+        getattr(editor, action)()
+
+    def _on_inspect(self, cell):
+        """Codewort-Inspektor: erklärt das Modul unter der Maus"""
+        if cell is None or not getattr(self, 'inspector_label', None) or not self.inspector_label.winfo_exists():
+            return
+        self.inspector_label.configure(text="  " + self._describe_module(*cell))
+
+    def _describe_module(self, r: int, c: int) -> str:
+        m = self.matrix
+        assert m is not None  # der Inspektor existiert nur im Editor
+        known = "bekannt" if m.locked[r, c] else "unbekannt"
+        where = f"Zeile {r + 1}, Spalte {c + 1}"
+        for copy, positions in enumerate(format_info_positions(m.size), start=1):
+            if (r, c) in positions:
+                return f"{where} · Format-Info, Bit {positions.index((r, c))} (Kopie {copy}) · {known}"
+        if m.fixed[r, c]:
+            if m.version >= 7 and any((r, c) in block for block in version_info_positions(m.size)):
+                kind = "Version-Info"
+            elif (r, c) == (4 * m.version + 9, 8):
+                kind = "Dark Module"
+            elif (r <= 7 and c <= 7) or (r <= 7 and c >= m.size - 8) or (r >= m.size - 8 and c <= 7):
+                kind = "Finder-Pattern / Separator"
+            elif r == 6 or c == 6:
+                kind = "Timing-Pattern"
+            else:
+                kind = "Alignment-Pattern"
+            return f"{where} · {kind} (fest, aus der Version)"
+        report = self._last_report
+        if report is None or report.module_codeword is None:
+            return f"{where} · {known}"
+        if report.module_codeword[r, c] < 0:
+            return f"{where} · Restbit (gehört zu keinem Codewort) · {known}"
+        index = int(report.module_codeword[r, c])
+        block, pos, is_ec = report.codeword_location[index]
+        text = (f"{where} · Codewort {index + 1} · Block {block + 1}, Byte {pos + 1} "
+                f"({'Fehlerkorrektur' if is_ec else 'Daten'}) · Bit {report.module_bit[r, c]} · {known}")
+        # Wert des Codeworts (entmaskiert), wenn alle 8 Bits bekannt sind
+        if self._inspect_cache[0] is not report:
+            reading = read_codewords((m.grid == 1).astype('uint8'), m.locked, m.version, report.format.mask)
+            self._inspect_cache = (report, reading)
+        reading = self._inspect_cache[1]
+        if reading.known_masks[index] == 0xFF:
+            # Nur hex: Zeichen sind gegenüber den Codewörtern um den Modus-Indikator (4 Bit) verschoben
+            text += f" · Wert 0x{reading.values[index]:02X}"
+        return text
+
     def _show_analysis(self, report):
         labels = getattr(self, 'stats_labels', None)
         if not labels or not labels["Lösbarkeit"].winfo_exists():
@@ -665,6 +744,8 @@ class MainWindowMixin:
             labels["Lösbarkeit"].configure(text="Fehler", text_color=Colors.ERROR)
             return
         
+        self._last_report = report
+        self._inspect_cache = (None, None)
         text, color = VERDICT_DISPLAY[report.verdict]
         labels["Lösbarkeit"].configure(text=text, text_color=color)
         fmt = report.format
@@ -674,7 +755,11 @@ class MainWindowMixin:
         elif fmt.mismatches:
             fmt_text += f" ({fmt.mismatches} Bit abweichend)"
         labels["Format"].configure(text=fmt_text)
-        self.analysis_message.configure(text=report.message)
+        message = report.message
+        if report.verdict == VERDICT_AMBIGUOUS:
+            message += (" Tipp: Den bekannten Textanfang eintragen (z.B. https://) - die Rekonstruktion "
+                        "nutzt zusätzlich den Aufbau der Daten (Länge, Füllbytes).")
+        self.analysis_message.configure(text=message)
         
         # Blöcke: bei wenigen einzeln auflisten, sonst zusammenfassen
         if len(report.blocks) <= 4:
@@ -703,8 +788,8 @@ class MainWindowMixin:
         
         if hasattr(self, 'btn_start'):
             self.btn_start.configure(state="disabled", text="⏳ Arbeite...")
-            
-        self._build_results_view()
+        # Alle Eingaben des Editors lesen, bevor die Ergebnisansicht ihn ersetzt
+        self.known_prefix = self.prefix_entry.get().strip() if hasattr(self, 'prefix_entry') else ''
         
         mode = self.mode_var.get()
         max_iter = None
@@ -736,8 +821,9 @@ class MainWindowMixin:
             max_time = 120
         
         self._run_settings = (mode, max_iter, max_time)
+        self._build_results_view()
         self.is_running = True
-        job = Reconstructor(self.matrix, self.validator)
+        job = Reconstructor(self.matrix, self.validator, known_prefix=self.known_prefix)
         self._start_job(job, lambda: job.run(max_time=max_time), "rs_complete")
 
     def _start_job(self, job, run_job, complete_message):
@@ -845,9 +931,7 @@ class MainWindowMixin:
         self.progress_bar.pack(fill="x")
         self.progress_bar.start()
         
-        self.results_view = ResultsView(main)
-        self.results_view.pack(fill="both", expand=True, padx=20, pady=20)
-        
+        # Untere Leiste zuerst packen, damit sie nie von der (wachsenden) Ergebnisansicht verdrängt wird
         bottom = ctk.CTkFrame(main, fg_color=Colors.BG_SECONDARY, height=60, corner_radius=Dimensions.CORNER_RADIUS_NONE)
         bottom.pack(fill="x", side="bottom")
         ctk.CTkFrame(bottom, fg_color="#d1d5db", height=1).pack(fill="x", side="top")
@@ -860,6 +944,9 @@ class MainWindowMixin:
             hover_color=Colors.BG_CARD_HOVER,
             corner_radius=Dimensions.CORNER_RADIUS_M
         ).pack(side="left", padx=20, pady=12)
+        
+        self.results_view = ResultsView(main)
+        self.results_view.pack(fill="both", expand=True, padx=20, pady=20)
     
     def _update_progress_ui(self, tested, valid, total):
         self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")

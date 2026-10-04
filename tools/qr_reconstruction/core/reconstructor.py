@@ -24,15 +24,18 @@ import numpy as np
 from .codewords import deinterleave, interleave, read_codewords, render_matrix
 from .data_decoder import DataDecodeError, decode_data
 from .gil import GilYielder
+from .structure import Hypothesis, constraints, hypotheses, prefix_constraints
 from .qr_matrix import QRMatrix
 from .rs_decoder import BlockSolution, solve_block
-from .spec import VALID_FORMATS, block_layout, format_info_positions
+from .spec import MODE_BYTE as MODE_BYTE_FOR_PREFIX, VALID_FORMATS, block_layout, format_info_positions
 from .validator import QRValidator, ValidationResult
 
 logger = logging.getLogger(__name__)
 
 # Mehr Kombinationen werden bei mehrdeutigen Lösungen nicht durchprobiert
 DEFAULT_MAX_CANDIDATES = 1 << 16
+# Unter einer Struktur-Annahme dürfen höchstens so viele Bits offen bleiben (werden durchprobiert)
+STRUCTURE_MAX_FREE_BITS = 12
 # Formate mit bis zu so vielen zusätzlichen Abweichungen gegenüber dem besten werden zuerst geprüft
 FORMAT_SLACK = 2
 
@@ -76,6 +79,7 @@ class _Candidate:
     ambiguous_bits: int
     content: float    # Inhalts-Score 0..1 (URL/Wörterbuch/Lesbarkeit)
     complete: bool    # False, wenn nicht alle mehrdeutigen Lösungen durchprobiert wurden
+    assumption: str = ''  # Struktur-Annahme, unter der die Lösung eindeutig ist (leer = keine nötig)
 
 
 # Obergrenze der Confidence, wenn der Lösungsraum nicht vollständig durchsucht wurde
@@ -89,9 +93,14 @@ class Reconstructor:
     Liefert ValidationResults im selben Format wie die BruteforceEngine (method="rs").
     """
 
-    def __init__(self, matrix: QRMatrix, validator: Optional[QRValidator] = None):
+    def __init__(self, matrix: QRMatrix, validator: Optional[QRValidator] = None, known_prefix: str = ''):
+        """
+        Args:
+            known_prefix: bekannter Textanfang (z.B. "https://"), hilft bei mehrdeutigem Schaden
+        """
         self.matrix = matrix
         self.validator = validator or QRValidator()
+        self.known_prefix = known_prefix.encode('utf-8')
         self.progress_callback: Optional[Callable] = None
         self.result_callback: Optional[Callable] = None
         self._should_stop = False
@@ -195,6 +204,11 @@ class Reconstructor:
         free_bits = sum(s.free_bits for s in solutions)
         unknown = sum(s.unknown_codewords for s in solutions)
         errors = sum(s.corrected_errors for s in solutions)
+        if free_bits > 0:
+            # Mehrdeutig: erst mit Wissen über den Aufbau der Daten (Modus, Länge, Füllbytes) versuchen
+            structured = self._solve_with_structure(fmt, value_blocks, mask_blocks, unknown, deadline)
+            if structured:
+                return structured
         combos = min(1 << free_bits, max_candidates)
         complete = combos == (1 << free_bits)
         if not complete:
@@ -231,13 +245,98 @@ class Reconstructor:
             ))
         return results
 
+    def _solve_with_structure(self, fmt: FormatCandidate, value_blocks: List[List[int]],
+                              mask_blocks: List[List[int]], unknown: int, deadline: float) -> List[_Candidate]:
+        """
+        Probiert Struktur-Hypothesen (core/structure.py): Jede legt Modus-Indikator, Zeichenzähler,
+        Terminator und Füllbytes fest. Nur Hypothesen, die zu den bekannten Bits passen und die Lösung
+        eindeutig machen, ergeben Kandidaten.
+        """
+        version, level = self.matrix.version, fmt.ec_level
+        layout = block_layout(version, level)
+        # Datenstrom-Byte → (Block, Position im Block)
+        data_positions = [(b, i) for b, (data_len, _) in enumerate(layout) for i in range(data_len)]
+
+        def attempt(fixed) -> Optional[List[BlockSolution]]:
+            fixed_values, fixed_masks = fixed
+            values = [list(v) for v in value_blocks]
+            masks = [list(m) for m in mask_blocks]
+            for (b, i), fv, fm in zip(data_positions, fixed_values, fixed_masks):
+                if not fm:
+                    continue
+                overlap = masks[b][i] & fm
+                if (values[b][i] ^ fv) & overlap:
+                    return None  # widerspricht bekannten Pixeln
+                masks[b][i] |= fm
+                values[b][i] = (values[b][i] & ~fm & 0xFF) | fv
+            solutions = []
+            free = 0
+            for vals, msks, (_, nsym) in zip(values, masks, layout):
+                solution = solve_block(vals, msks, nsym, allow_errors=False)
+                if solution is None:
+                    return None
+                free += solution.free_bits
+                if free > STRUCTURE_MAX_FREE_BITS:
+                    return None
+                solutions.append(solution)
+            return solutions
+
+        candidates: List[Tuple[Hypothesis, List[BlockSolution]]] = []
+        yield_gil = GilYielder()
+        for hypothesis in hypotheses(version, level, self.known_prefix):
+            if self._should_stop or time.time() > deadline:
+                break
+            yield_gil()
+            fixed = constraints(hypothesis, version, level)
+            solutions = attempt(fixed) if fixed else None
+            if solutions is not None:
+                candidates.append((hypothesis, solutions))
+        if not candidates and self.known_prefix:
+            fixed = prefix_constraints(self.known_prefix, version, level)
+            solutions = attempt(fixed) if fixed else None
+            if solutions is not None:
+                candidates.append((Hypothesis(MODE_BYTE_FOR_PREFIX, len(self.known_prefix), self.known_prefix),
+                                   solutions))
+
+        results = []
+        for hypothesis, solutions in candidates:
+            free = sum(s.free_bits for s in solutions)
+            for selection in range(1 << free):
+                if selection % 256 == 0 and (self._should_stop or time.time() > deadline):
+                    break
+                blocks, rest = [], selection
+                for s in solutions:
+                    blocks.append(s.codeword(rest & ((1 << s.free_bits) - 1)))
+                    rest >>= s.free_bits
+                data = bytes(byte for block, (data_len, _) in zip(blocks, layout) for byte in block[:data_len])
+                try:
+                    decoded = decode_data(data, version)
+                except DataDecodeError:
+                    continue
+                results.append(_Candidate(
+                    text=decoded.text,
+                    padding_ok=decoded.padding_ok,
+                    fmt=fmt,
+                    codewords=interleave(blocks, version, level),
+                    unknown_codewords=unknown,
+                    corrected_errors=0,
+                    ambiguous_bits=free,
+                    content=self.validator.content_scorer.score_content(decoded.text).total_score,
+                    complete=True,
+                    assumption=hypothesis.describe(),
+                ))
+        if results:
+            logger.info("Format %s/%d: %d Lösung(en) über Struktur-Annahmen", level, fmt.mask, len(results))
+        return results
+
     def _build_result(self, cand: _Candidate, total_candidates: int) -> ValidationResult:
         """
         Rendert die Lösung, lässt sie von pyzbar gegenprüfen und berechnet die Confidence:
           40  RS-konsistent (Voraussetzung für jede Lösung)
         + 20  Format-Bits passen (anteilig)
         + 15  Terminator/Padding korrekt
-        + 25  Eindeutigkeit: eindeutig → voll, sonst halber Inhalts-Score
+        + 25  Eindeutigkeit: eindeutig → voll (×0.8, wenn nur unter einer Struktur-Annahme),
+              sonst halber Inhalts-Score
         -  5  je korrigiertem (falsch abgemaltem) Codewort
         Wurde ein mehrdeutiger Lösungsraum nur teilweise durchsucht, höchstens INCOMPLETE_CONFIDENCE_CAP.
         """
@@ -251,6 +350,8 @@ class Reconstructor:
 
         unique = total_candidates == 1 and cand.ambiguous_bits == 0
         certainty = 1.0 if unique else 0.5 * content.total_score
+        if cand.assumption:
+            certainty *= 0.8
         confidence = (40 + 20 * cand.fmt.score + 15 * cand.padding_ok + 25 * certainty
                       - 5 * cand.corrected_errors)
         if not cand.complete:
@@ -263,6 +364,8 @@ class Reconstructor:
                  f"{cand.corrected_errors} Fehler korrigiert | "
                  f"2^{cand.ambiguous_bits} Lösungen{'' if cand.complete else ' (nicht alle geprüft)'} | "
                  f"Padding {'ok' if cand.padding_ok else 'abweichend'} | pyzbar: {pyzbar_text!r}")
+        if cand.assumption:
+            debug += f" | Annahme: {cand.assumption}"
 
         check.is_valid = True
         check.confidence = confidence
@@ -280,6 +383,7 @@ class Reconstructor:
         check.corrected_errors = cand.corrected_errors
         check.ambiguous_bits = cand.ambiguous_bits
         check.padding_ok = cand.padding_ok
+        check.assumption = cand.assumption
         # Ein Standard-Decoder akzeptiert das rekonstruierte Symbol. Den Text vergleichen wir bewusst
         # nicht: zbar rät die Zeichenkodierung von Byte-Segmenten und liest UTF-8 teils als Shift-JIS.
         check.decoder_confirmed = pyzbar_text is not None

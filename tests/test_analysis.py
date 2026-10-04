@@ -89,7 +89,9 @@ def test_verdict_matches_reconstructor():
             if report.verdict == VERDICT_UNIQUE:
                 assert results[0].decoded_data == URL and results[0].ambiguous_bits == 0
             elif report.verdict == VERDICT_AMBIGUOUS:
-                assert results and results[0].ambiguous_bits == report.free_bits
+                # Entweder die rohe Mehrdeutigkeit - oder eine Struktur-Annahme hat sie verringert
+                assert results
+                assert results[0].assumption or results[0].ambiguous_bits == report.free_bits
 
 
 def test_overlay_maps(original):

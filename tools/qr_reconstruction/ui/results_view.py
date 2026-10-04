@@ -350,7 +350,26 @@ class ResultsView(ctk.CTkFrame):
             corner_radius=Dimensions.CORNER_RADIUS_M,
             border_width=Dimensions.BORDER_WIDTH_THIN
         )
-        self.content_text.pack(fill="x", padx=15, pady=(0, 15))
+        self.content_text.pack(fill="x", padx=15, pady=(0, 6))
+        
+        # Aktionen für das ausgewählte Ergebnis
+        actions = ctk.CTkFrame(right_card, fg_color="transparent")
+        actions.pack(fill="x", padx=15, pady=(0, 15))
+        button_style = dict(height=30, font=("Segoe UI", 11), fg_color=Colors.BG_CARD,
+                            text_color=Colors.TEXT_PRIMARY, hover_color=Colors.BG_CARD_HOVER,
+                            border_width=Dimensions.BORDER_WIDTH_THIN, border_color=Colors.BORDER,
+                            corner_radius=Dimensions.CORNER_RADIUS_M)
+        self.btn_copy = ctk.CTkButton(actions, text="📋 Kopieren", width=95, command=self._copy_text, **button_style)
+        self.btn_copy.pack(side="left", padx=(0, 6))
+        self.btn_open = ctk.CTkButton(actions, text="🌐 Öffnen", width=85, command=self._open_url, **button_style)
+        self.btn_open.pack(side="left", padx=(0, 6))
+        self.btn_save_code = ctk.CTkButton(actions, text="💾 Code speichern", width=130,
+                                           command=self._save_code, **button_style)
+        self.btn_save_code.pack(side="left")
+        self.action_status = ctk.CTkLabel(right_card, text="", font=("Segoe UI", 10), text_color=Colors.TEXT_MUTED)
+        self.action_status.pack(padx=15, anchor="w")
+        self.current_result: Optional[ValidationResult] = None
+        self._set_actions_enabled(False)
     
     def set_results(self, results: List[ValidationResult]):
         """Setzt neue Ergebnisse"""
@@ -457,6 +476,8 @@ class ResultsView(ctk.CTkFrame):
                 info += f", {result.corrected_errors} falsch abgemalte korrigiert"
             if result.ambiguous_bits:
                 info += f"\nMehrdeutig: 2^{result.ambiguous_bits} mögliche Lösungen"
+            if result.assumption:
+                info += f"\nAnnahme: {result.assumption}"
         else:
             info = "Pixel-Bruteforce"
         self.method_label.configure(text=info)
@@ -487,6 +508,10 @@ class ResultsView(ctk.CTkFrame):
             label.configure(text=f"{score_values.get(key, 0):.0f}%")
         
         # Content
+        self.current_result = result
+        text = (result.decoded_data or "").strip().lower()
+        self._set_actions_enabled(bool(result.decoded_data), text.startswith(("http://", "https://", "www.")))
+        self.action_status.configure(text="")
         self.content_text.delete("1.0", "end")
         if result.decoded_data:
             self.content_text.insert("1.0", result.decoded_data)
@@ -590,6 +615,44 @@ class ResultsView(ctk.CTkFrame):
         
         # Focus
         top.after(100, top.focus)
+
+    def _set_actions_enabled(self, enabled: bool, is_url: bool = False):
+        self.btn_copy.configure(state="normal" if enabled else "disabled")
+        self.btn_save_code.configure(state="normal" if enabled else "disabled")
+        self.btn_open.configure(state="normal" if enabled and is_url else "disabled")
+
+    def _copy_text(self):
+        if self.current_result and self.current_result.decoded_data:
+            self.clipboard_clear()
+            self.clipboard_append(self.current_result.decoded_data)
+            self.action_status.configure(text="In die Zwischenablage kopiert")
+
+    def _open_url(self):
+        text = (self.current_result.decoded_data or "").strip() if self.current_result else ""
+        if text.lower().startswith(("http://", "https://")):
+            import webbrowser
+            webbrowser.open(text)
+        elif text.lower().startswith("www."):
+            import webbrowser
+            webbrowser.open("https://" + text)
+
+    def _save_code(self):
+        """Rekonstruierten Code mit Ruhezone speichern - scanbar und druckbar"""
+        if self.current_result is None:
+            return
+        from tkinter import filedialog
+        from ..core.export import save_matrix
+        path = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(), defaultextension=".png", title="Rekonstruierten QR-Code speichern",
+            filetypes=[("PNG", "*.png"), ("SVG (Vektor)", "*.svg"), ("JPEG", "*.jpg")])
+        if not path:
+            return
+        try:
+            save_matrix(self.current_result.matrix, path)
+            self.action_status.configure(text=f"Gespeichert: {path}")
+        except OSError as e:
+            logger.exception("Speichern fehlgeschlagen")
+            messagebox.showerror("Speichern fehlgeschlagen", str(e), parent=self.winfo_toplevel())
 
     def _save_preview_image(self, img):
         from tkinter import filedialog

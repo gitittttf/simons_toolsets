@@ -56,6 +56,7 @@ class ValidationResult:
     ambiguous_bits: int = 0      # Freiheitsgrade: 0 = eindeutig, sonst 2^n mögliche Lösungen
     padding_ok: bool = True      # Terminator/Padding entsprechen der Spezifikation
     decoder_confirmed: bool = False  # pyzbar liest die rekonstruierte Matrix mit demselben Inhalt
+    assumption: str = ""         # Struktur-Annahme, unter der die Lösung eindeutig wurde
 
     # Debug-Info
     debug_info: str = ""

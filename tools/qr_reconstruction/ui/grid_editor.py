@@ -76,8 +76,13 @@ class GridEditor(ctk.CTkFrame):
         self.overlay_report: Optional[SolvabilityReport] = None
         self._overlay_format_cells: Set[Tuple[int, int]] = set()
         
+        # Rückgängig/Wiederholen: Schnappschüsse (grid, locked) vor jeder Änderung
+        self._undo_stack: list = []
+        self._redo_stack: list = []
+        
         # Callbacks
         self.on_cell_changed: Optional[Callable] = None
+        self.on_hover: Optional[Callable] = None   # (row, col) oder None beim Verlassen
         
         # Canvas Container
         self.canvas_frame = ctk.CTkFrame(self, fg_color=Colors.BG_SECONDARY, corner_radius=0)
@@ -389,6 +394,7 @@ class GridEditor(ctk.CTkFrame):
         if cell:
             r, c = cell
             if not self.matrix._is_fixed_pattern(r, c):
+                self.push_undo()
                 self.is_drawing = True
                 # Erste Zelle bestimmt die Farbe des Strichs: unbekannt/weiß → schwarz, schwarz → weiß
                 known_black = self.matrix.locked[r, c] and self.matrix.grid[r, c] == CellState.BLACK
@@ -423,6 +429,32 @@ class GridEditor(ctk.CTkFrame):
                     self.render()
                     self._notify()
 
+    # --- Rückgängig / Wiederholen ---
+    UNDO_LIMIT = 100
+
+    def push_undo(self):
+        """Vor einer Änderung aufrufen (Pinselstrich, Werkzeug-Button)"""
+        self._undo_stack.append((self.matrix.grid.copy(), self.matrix.locked.copy()))
+        del self._undo_stack[:-self.UNDO_LIMIT]
+        self._redo_stack.clear()
+
+    def _restore(self, source: list, target: list) -> bool:
+        if not source:
+            return False
+        target.append((self.matrix.grid.copy(), self.matrix.locked.copy()))
+        grid, locked = source.pop()
+        self.matrix.grid[...] = grid
+        self.matrix.locked[...] = locked
+        self.render()
+        self._notify()
+        return True
+
+    def undo(self) -> bool:
+        return self._restore(self._undo_stack, self._redo_stack)
+
+    def redo(self) -> bool:
+        return self._restore(self._redo_stack, self._undo_stack)
+
     def _paint(self, r, c):
         """Gemalte Zellen sind bekannt"""
         self.matrix.grid[r, c] = self.draw_value
@@ -444,6 +476,7 @@ class GridEditor(ctk.CTkFrame):
         if cell:
             r, c = cell
             if not self.matrix._is_fixed_pattern(r, c):
+                self.push_undo()
                 self.is_locking = True
                 # Erste Zelle bestimmt die Richtung: bekannt → unbekannt oder umgekehrt
                 self.lock_value = not self.matrix.locked[r, c]
@@ -510,6 +543,8 @@ class GridEditor(ctk.CTkFrame):
                 r = cell[0] if cell else None
                 c = cell[1] if cell else None
                 self._draw_cursor_hl(r, c)
+                if self.on_hover:
+                    self.on_hover(cell)
 
     def _notify(self):
         if self.on_cell_changed:
