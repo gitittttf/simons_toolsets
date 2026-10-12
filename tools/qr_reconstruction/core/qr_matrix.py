@@ -13,6 +13,7 @@ Offizielle QR-Code Größen:
 import numpy as np
 from typing import List, Tuple, Optional, Dict
 from enum import IntEnum
+from .spec import version_bits, version_info_positions
 
 
 class CellState(IntEnum):
@@ -109,9 +110,7 @@ class QRMatrix:
         Args:
             size: Muss eine offizielle QR-Größe sein (21, 25, 29, ...)
         """
-        self.version = get_version_for_size(size)
-        
-        if self.version is None:
+        if get_version_for_size(size) is None:
             # Finde nächste gültige Größe
             valid_sizes = VALID_QR_SIZES
             if size < valid_sizes[0]:
@@ -124,11 +123,15 @@ class QRMatrix:
                     if vs >= size:
                         size = vs
                         break
-            self.version = get_version_for_size(size)
         
+        version = get_version_for_size(size)
+        assert version is not None
+        self.version: int = version
         self.size = size
         self.grid = np.full((size, size), CellState.UNKNOWN, dtype=int)
         self.locked = np.zeros((size, size), dtype=bool)
+        # Feste Funktionsmuster (durch Spezifikation vorgegeben, nie entsperrbar)
+        self.fixed = np.zeros((size, size), dtype=bool)
         
         # Füge offizielle QR-Struktur hinzu
         self._add_fixed_patterns()
@@ -240,16 +243,18 @@ class QRMatrix:
                             self._set_locked(pr, pc, CellState.WHITE)
     
     def _add_version_info_areas(self):
-        """Reserviert Bereiche für Version-Info (ab Version 7)"""
-        # Diese Bereiche werden später mit Versionsinformationen gefüllt
-        # Für Rekonstruktion markieren wir sie als unbekannt
-        pass  # Lasse sie als unbekannt für Bruteforce
+        """Version-Info (ab Version 7): folgt deterministisch aus der Version (BCH(18,6))"""
+        bits = version_bits(self.version)
+        for block in version_info_positions(self.size):
+            for i, (r, c) in enumerate(block):
+                self._set_locked(r, c, CellState.BLACK if (bits >> i) & 1 else CellState.WHITE)
     
     def _set_locked(self, row: int, col: int, value: CellState):
-        """Setzt eine Zelle und sperrt sie"""
+        """Setzt eine Zelle eines festen Musters und sperrt sie dauerhaft"""
         if 0 <= row < self.size and 0 <= col < self.size:
             self.grid[row, col] = value
             self.locked[row, col] = True
+            self.fixed[row, col] = True
     
     def set_cell(self, row: int, col: int, value: CellState, locked: bool = True):
         """Setzt eine einzelne Zelle"""
@@ -285,27 +290,9 @@ class QRMatrix:
             self.locked[row, col] = False
     
     def _is_fixed_pattern(self, row: int, col: int) -> bool:
-        """Prüft ob Zelle Teil der festen QR-Struktur ist"""
-        # Finder-Patterns (7×7) + Separatoren (1 breit) = 8×8 Bereich
-        # Indices 0-7 = 8 Zellen
-        
-        # Oben links: rows 0-7, cols 0-7
-        if row <= 7 and col <= 7:
-            return True
-        
-        # Oben rechts: rows 0-7, cols size-8 bis size-1
-        if row <= 7 and col >= self.size - 8:
-            return True
-        
-        # Unten links: rows size-8 bis size-1, cols 0-7
-        if row >= self.size - 8 and col <= 7:
-            return True
-        
-        # Timing-Patterns (Zeile 6, Spalte 6)
-        if row == 6 or col == 6:
-            return True
-        
-        return False
+        """Prüft ob Zelle Teil der festen QR-Struktur ist (Finder, Separatoren,
+        Timing, Alignment, Dark Module, Version-Info)"""
+        return bool(self.fixed[row, col])
     
     def get_unknown_cells(self) -> List[Tuple[int, int]]:
         """Gibt alle nicht gesperrten Zellen zurück"""
@@ -348,12 +335,14 @@ class QRMatrix:
         new.version = self.version
         new.grid = self.grid.copy()
         new.locked = self.locked.copy()
+        new.fixed = self.fixed.copy()
         return new
     
     def reset(self):
         """Setzt die Matrix zurück"""
         self.grid = np.full((self.size, self.size), CellState.UNKNOWN, dtype=int)
         self.locked = np.zeros((self.size, self.size), dtype=bool)
+        self.fixed = np.zeros((self.size, self.size), dtype=bool)
         self._add_fixed_patterns()
     
     def __repr__(self):

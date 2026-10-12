@@ -44,6 +44,15 @@ class Colors:
     
     QR_HOVER = "#60a5fa"             # Light Hover Blue
     QR_PAINTING = "#f97316"          # Orange (while painting)
+    QR_UNKNOWN = "#c3c9d2"           # Grau: Pixel unbekannt
+    QR_UNKNOWN_MARK = "#6b7280"      # "?" auf unbekannten Pixeln
+
+    # Overlay (Lösbarkeit je RS-Block / Format-Info)
+    OVERLAY_OK = "#22c55e"           # Block eindeutig lösbar
+    OVERLAY_CORRECTED = "#eab308"    # lösbar, aber mit Fehlerkorrektur
+    OVERLAY_AMBIGUOUS = "#f97316"    # mehrdeutig
+    OVERLAY_UNSOLVABLE = "#dc2626"   # widersprüchlich
+    OVERLAY_FORMAT = "#8b5cf6"       # Format-Info-Module
 
 class Fonts:
     """Standardized Typography"""

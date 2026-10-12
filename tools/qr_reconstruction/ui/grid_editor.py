@@ -1,7 +1,11 @@
 import customtkinter as ctk
-from typing import Callable, Optional, Set, Tuple
 import numpy as np
+from PIL import Image, ImageTk
+from typing import Any, Callable, Optional, Set, Tuple
 from ..core.qr_matrix import QRMatrix, CellState
+from ..core.analysis import (
+    BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, SolvabilityReport,
+)
 
 from .theme import Colors, Dimensions
 
@@ -9,9 +13,25 @@ from .theme import Colors, Dimensions
 # THEME (Loaded from theme.py)
 # =============================================================================
 
+# Overlay-Farbe je Block-Status (siehe core.analysis)
+OVERLAY_COLORS = {
+    BLOCK_OK: Colors.OVERLAY_OK,
+    BLOCK_CORRECTED: Colors.OVERLAY_CORRECTED,
+    BLOCK_AMBIGUOUS: Colors.OVERLAY_AMBIGUOUS,
+    BLOCK_UNSOLVABLE: Colors.OVERLAY_UNSOLVABLE,
+}
+
+
 class GridEditor(ctk.CTkFrame):
     """
     Zoomable & Pannable Grid Editor (Photoshop-style)
+
+    Bedienung:
+      Linksklick/-ziehen   Schwarz/Weiß malen (Zelle wird bekannt)
+      Rechtsklick/-ziehen  Zelle als unbekannt markieren bzw. wieder als bekannt übernehmen
+      Mausrad              Zoom, Strg+Linksklick oder Mittelklick: verschieben
+
+    "Bekannt" entspricht matrix.locked; unbekannte Zellen werden grau mit "?" gezeichnet.
     """
     
     def __init__(self, parent, matrix: QRMatrix, cell_size=22):
@@ -42,9 +62,27 @@ class GridEditor(ctk.CTkFrame):
         self.locked_cells: Set[Tuple[int, int]] = set()
         
         self.hovered_cell = None
+        # Solange der Nutzer nicht selbst zoomt/verschiebt, bleibt der Code bei Größenänderung zentriert
+        self.user_moved_view = False
+        
+        # Foto-Hintergrund (entzerrtes Bild aus dem Import)
+        self.photo: Optional[np.ndarray] = None
+        self.show_photo = False
+        # (Schlüssel, PhotoImage) - nur bei Zoom/Pan neu skalieren
+        self._photo_cache: Tuple[Any, Any] = (None, None)
+        
+        # Overlay (Lösbarkeit je Block, Format-Info)
+        self.overlay_enabled = False
+        self.overlay_report: Optional[SolvabilityReport] = None
+        self._overlay_format_cells: Set[Tuple[int, int]] = set()
+        
+        # Rückgängig/Wiederholen: Schnappschüsse (grid, locked) vor jeder Änderung
+        self._undo_stack: list = []
+        self._redo_stack: list = []
         
         # Callbacks
         self.on_cell_changed: Optional[Callable] = None
+        self.on_hover: Optional[Callable] = None   # (row, col) oder None beim Verlassen
         
         # Canvas Container
         self.canvas_frame = ctk.CTkFrame(self, fg_color=Colors.BG_SECONDARY, corner_radius=0)
@@ -154,6 +192,9 @@ class GridEditor(ctk.CTkFrame):
             tags="board_bg"
         )
         
+        if self.show_photo and self.photo is not None:
+            self._draw_photo(total_size)
+        
         # Simple mode for tiny cells to improve performance
         simple_mode = cell_pixel_size < 4
         
@@ -183,28 +224,103 @@ class GridEditor(ctk.CTkFrame):
             outline=Colors.ACCENT, width=Dimensions.GRID_OUTER_BORDER_WIDTH
         )
 
+    def set_photo(self, photo: Optional[np.ndarray], show: bool = True):
+        """Setzt das entzerrte Foto (quadratisch, RGB oder grau) als Hintergrund"""
+        self.photo = photo
+        self.show_photo = show and photo is not None
+        self._photo_cache = (None, None)
+        self.render()
+
+    def _draw_photo(self, total_size: float):
+        """Zeichnet den sichtbaren Ausschnitt des Fotos (gecacht, solange sich Zoom/Ausschnitt nicht ändern)"""
+        if self.photo is None:
+            return
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        # Sichtbarer Bereich in Grid-Pixeln
+        x0, y0 = max(0.0, -self.offset_x), max(0.0, -self.offset_y)
+        x1, y1 = min(total_size, cw - self.offset_x), min(total_size, ch - self.offset_y)
+        if x1 - x0 < 1 or y1 - y0 < 1:
+            return
+        key = (round(total_size), round(x0), round(y0), round(x1), round(y1))
+        if self._photo_cache[0] != key:
+            scale = self.photo.shape[0] / total_size
+            crop = self.photo[int(y0 * scale):max(int(y0 * scale) + 1, int(y1 * scale)),
+                              int(x0 * scale):max(int(x0 * scale) + 1, int(x1 * scale))]
+            image = Image.fromarray(crop).resize((key[3] - key[1], key[4] - key[2]), Image.Resampling.BILINEAR)
+            self._photo_cache = (key, ImageTk.PhotoImage(image))
+        self.canvas.create_image(self.offset_x + key[1], self.offset_y + key[2],
+                                 image=self._photo_cache[1], anchor="nw")
+
+    def set_overlay(self, report: Optional[SolvabilityReport], enabled: Optional[bool] = None):
+        """Setzt die Analyse für das Overlay (und optional, ob es angezeigt wird) und zeichnet neu"""
+        self.overlay_report = report
+        self._overlay_format_cells = set(report.format_cells) if report else set()
+        if enabled is not None:
+            self.overlay_enabled = enabled
+        self.render()
+
+    def _overlay_color(self, r, c) -> Optional[str]:
+        report = self.overlay_report
+        if not self.overlay_enabled or report is None:
+            return None
+        if (r, c) in self._overlay_format_cells:
+            return Colors.OVERLAY_FORMAT
+        if (report.module_affected is not None and report.module_block is not None
+                and report.module_affected[r, c]):
+            block = report.module_block[r, c]
+            if 0 <= block < len(report.blocks):
+                return OVERLAY_COLORS[report.blocks[block].status]
+        return None
+
     def _draw_single_cell(self, r, c, size, simple_mode):
         x = c * size + self.offset_x
         y = r * size + self.offset_y
         
         val = self.matrix.grid[r, c]
-        locked = self.matrix.locked[r, c]
+        known = self.matrix.locked[r, c]
         fixed = self.matrix._is_fixed_pattern(r, c)
         
-        # Colors logic
+        if self.show_photo and self.photo is not None:
+            self._draw_photo_cell(x, y, size, val, known, fixed, simple_mode)
+        else:
+            self._draw_plain_cell(x, y, size, val, known, fixed, simple_mode)
+
+        # Overlay als farbiger Innenrahmen (Stipple-Füllungen gibt es nicht auf allen Plattformen)
+        overlay = self._overlay_color(r, c)
+        if overlay:
+            inset = max(1.0, size * 0.12)
+            self.canvas.create_rectangle(
+                x + inset, y + inset, x + size - inset, y + size - inset,
+                outline=overlay, width=max(1, int(size * 0.12)),
+            )
+
+    def _draw_photo_cell(self, x, y, size, val, known, fixed, simple_mode):
+        """Foto sichtbar lassen: bekannt = kleiner Punkt in der abgetasteten Farbe, unbekannt = orange '?'"""
+        if fixed or simple_mode:
+            return
+        if known:
+            r = size * 0.16
+            cx, cy = x + size / 2, y + size / 2
+            fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=Colors.ACCENT, width=1)
+        else:
+            self.canvas.create_rectangle(x + 1, y + 1, x + size - 1, y + size - 1,
+                                         outline=Colors.QR_PAINTING, width=2)
+            if size > 12:
+                self.canvas.create_text(x + size / 2, y + size / 2, text="?", fill=Colors.QR_PAINTING,
+                                        font=(Dimensions.GRID_MARKER_FONT,
+                                              int(size / Dimensions.GRID_MARKER_LOCKED_DIVIDER), "bold"))
+
+    def _draw_plain_cell(self, x, y, size, val, known, fixed, simple_mode):
         if fixed:
             fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
             outline = Colors.QR_PATTERN_BORDER
-        elif locked:
+        elif known:
             fill = Colors.QR_LOCKED_BLACK if val == CellState.BLACK else Colors.QR_LOCKED_WHITE
-            outline = Colors.QR_LOCKED_BORDER
-        else:
-            fill = Colors.QR_BLACK if val == CellState.BLACK else Colors.QR_WHITE
-            # Default to faint border instead of empty
             outline = Colors.QR_GRID_LINE
-            if val == CellState.WHITE:
-                # Keep outline for white cells to show grid
-                pass 
+        else:
+            fill = Colors.QR_UNKNOWN
+            outline = Colors.QR_GRID_LINE
 
         if simple_mode:
             self.canvas.create_rectangle(x, y, x+size, y+size, fill=fill, width=Dimensions.GRID_CELL_BORDER_NONE)
@@ -220,10 +336,9 @@ class GridEditor(ctk.CTkFrame):
                          cx, cy, text="x", fill=tcol, 
                          font=(Dimensions.GRID_MARKER_FONT, int(size/Dimensions.GRID_MARKER_FIXED_DIVIDER))
                      )
-                elif locked:
-                     tcol = "#ffffff" if val == CellState.BLACK else Colors.ACCENT
+                elif not known:
                      self.canvas.create_text(
-                         cx, cy, text="o", fill=tcol, 
+                         cx, cy, text="?", fill=Colors.QR_UNKNOWN_MARK,
                          font=(Dimensions.GRID_MARKER_FONT, int(size/Dimensions.GRID_MARKER_LOCKED_DIVIDER))
                      )
 
@@ -239,8 +354,8 @@ class GridEditor(ctk.CTkFrame):
              )
 
     def _on_resize(self, event):
-        # Optional: re-center or just keep valid
-        pass
+        if not self.user_moved_view:
+            self._center_view()
 
     def _on_wheel(self, event):
         x, y = event.x, event.y
@@ -251,6 +366,7 @@ class GridEditor(ctk.CTkFrame):
         else:
             scale_delta = 1.1
             
+        self.user_moved_view = True
         new_scale = self.scale * scale_delta
         if new_scale < 0.05: new_scale = 0.05
         if new_scale > 20.0: new_scale = 20.0
@@ -270,17 +386,20 @@ class GridEditor(ctk.CTkFrame):
         # Ctrl -> Pan
         if event.state & 0x4 or event.state & 0x20000: # Control key
             self.is_panning = True
+            self.user_moved_view = True
             self.canvas.config(cursor="fleur")
             return
 
         cell = self._to_grid(event.x, event.y)
         if cell:
             r, c = cell
-            if not self.matrix.locked[r, c] and not self.matrix._is_fixed_pattern(r, c):
+            if not self.matrix._is_fixed_pattern(r, c):
+                self.push_undo()
                 self.is_drawing = True
-                curr = self.matrix.grid[r, c]
-                self.draw_value = CellState.BLACK if curr == CellState.WHITE else CellState.WHITE
-                self.matrix.grid[r, c] = self.draw_value
+                # Erste Zelle bestimmt die Farbe des Strichs: unbekannt/weiß → schwarz, schwarz → weiß
+                known_black = self.matrix.locked[r, c] and self.matrix.grid[r, c] == CellState.BLACK
+                self.draw_value = CellState.WHITE if known_black else CellState.BLACK
+                self._paint(r, c)
                 self.painted_cells.add(cell)
                 self.render()
                 self._notify()
@@ -304,12 +423,42 @@ class GridEditor(ctk.CTkFrame):
             cell = self._to_grid(event.x, event.y)
             if cell and cell not in self.painted_cells:
                 r, c = cell
-                # Draw only allowed cells
-                if not self.matrix.locked[r, c] and not self.matrix._is_fixed_pattern(r, c):
-                    self.matrix.grid[r, c] = self.draw_value
+                if not self.matrix._is_fixed_pattern(r, c):
+                    self._paint(r, c)
                     self.painted_cells.add(cell)
                     self.render()
                     self._notify()
+
+    # --- Rückgängig / Wiederholen ---
+    UNDO_LIMIT = 100
+
+    def push_undo(self):
+        """Vor einer Änderung aufrufen (Pinselstrich, Werkzeug-Button)"""
+        self._undo_stack.append((self.matrix.grid.copy(), self.matrix.locked.copy()))
+        del self._undo_stack[:-self.UNDO_LIMIT]
+        self._redo_stack.clear()
+
+    def _restore(self, source: list, target: list) -> bool:
+        if not source:
+            return False
+        target.append((self.matrix.grid.copy(), self.matrix.locked.copy()))
+        grid, locked = source.pop()
+        self.matrix.grid[...] = grid
+        self.matrix.locked[...] = locked
+        self.render()
+        self._notify()
+        return True
+
+    def undo(self) -> bool:
+        return self._restore(self._undo_stack, self._redo_stack)
+
+    def redo(self) -> bool:
+        return self._restore(self._redo_stack, self._undo_stack)
+
+    def _paint(self, r, c):
+        """Gemalte Zellen sind bekannt"""
+        self.matrix.grid[r, c] = self.draw_value
+        self.matrix.locked[r, c] = True
 
     def _on_left_up(self, event):
         if self.is_panning:
@@ -321,16 +470,17 @@ class GridEditor(ctk.CTkFrame):
         self.painted_cells.clear()
         self.canvas.config(cursor="")
 
-    # --- RIGHT CLICK (Lock) ---
+    # --- RIGHT CLICK (unbekannt markieren / wieder als bekannt übernehmen) ---
     def _on_right_down(self, event):
         cell = self._to_grid(event.x, event.y)
         if cell:
             r, c = cell
             if not self.matrix._is_fixed_pattern(r, c):
+                self.push_undo()
                 self.is_locking = True
-                curr = self.matrix.locked[r, c]
-                self.lock_value = not curr
-                self.matrix.locked[r, c] = self.lock_value
+                # Erste Zelle bestimmt die Richtung: bekannt → unbekannt oder umgekehrt
+                self.lock_value = not self.matrix.locked[r, c]
+                self._set_known(r, c, self.lock_value)
                 self.locked_cells.add(cell)
                 self.render()
                 self._notify()
@@ -341,11 +491,17 @@ class GridEditor(ctk.CTkFrame):
             if cell and cell not in self.locked_cells:
                 r, c = cell
                 if not self.matrix._is_fixed_pattern(r, c):
-                    self.matrix.locked[r, c] = self.lock_value
+                    self._set_known(r, c, self.lock_value)
                     self.locked_cells.add(cell)
                     self.render()
                     self._notify()
                     
+    def _set_known(self, r, c, known: bool):
+        """Der Farbwert bleibt beim Unbekannt-Markieren erhalten und kommt beim Zurückschalten wieder"""
+        self.matrix.locked[r, c] = known
+        if known and self.matrix.grid[r, c] == CellState.UNKNOWN:
+            self.matrix.grid[r, c] = CellState.WHITE
+
     def _on_right_up(self, event):
         self.is_locking = False
         self.locked_cells.clear()
@@ -353,6 +509,7 @@ class GridEditor(ctk.CTkFrame):
     # --- MIDDLE CLICK (Pan) ---
     def _on_middle_down(self, event):
         self.is_panning = True
+        self.user_moved_view = True
         self.last_mouse_x = event.x
         self.last_mouse_y = event.y
         self.canvas.config(cursor="fleur")
@@ -386,6 +543,8 @@ class GridEditor(ctk.CTkFrame):
                 r = cell[0] if cell else None
                 c = cell[1] if cell else None
                 self._draw_cursor_hl(r, c)
+                if self.on_hover:
+                    self.on_hover(cell)
 
     def _notify(self):
         if self.on_cell_changed:

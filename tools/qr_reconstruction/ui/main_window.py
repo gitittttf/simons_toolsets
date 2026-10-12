@@ -8,18 +8,46 @@ Features:
 """
 
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
+import logging
+import queue
 import threading
 import sys
 from typing import Optional
 from .grid_editor import GridEditor
+from .corner_dialog import CornerDialog
 from .results_view import ResultsView
-from ..core.qr_matrix import QRMatrix, QR_VERSIONS, get_version_for_size
+from ..core.qr_matrix import QRMatrix, QR_VERSIONS
 from ..core.bruteforce import BruteforceEngine
+from ..core.reconstructor import Reconstructor
+from ..core import image_import
+from ..core.codewords import read_codewords
+from ..core.spec import format_info_positions, version_info_positions
+from ..core.analysis import (
+    VERDICT_AMBIGUOUS, VERDICT_COMPLETE, VERDICT_CORRECTABLE, VERDICT_INCONSISTENT, VERDICT_UNIQUE,
+    BLOCK_AMBIGUOUS, BLOCK_CORRECTED, BLOCK_OK, BLOCK_UNSOLVABLE, analyze_solvability,
+)
 from ..core.validator import QRValidator
 
 
 from .theme import Colors, Fonts, Dimensions
+logger = logging.getLogger(__name__)
+
+# Anzeige des Analyse-Ergebnisses: Text und Farbe je Urteil
+VERDICT_DISPLAY = {
+    VERDICT_COMPLETE: ("✓ Vollständig", Colors.SUCCESS),
+    VERDICT_UNIQUE: ("✓ Eindeutig lösbar", Colors.SUCCESS),
+    VERDICT_CORRECTABLE: ("⚠ Lösbar mit Korrektur", Colors.WARNING),
+    VERDICT_AMBIGUOUS: ("⚠ Mehrdeutig", Colors.WARNING),
+    VERDICT_INCONSISTENT: ("✗ Nicht lösbar", Colors.ERROR),
+}
+BLOCK_STATUS_NAMES = {
+    BLOCK_OK: "ok", BLOCK_CORRECTED: "korrigiert", BLOCK_AMBIGUOUS: "mehrdeutig", BLOCK_UNSOLVABLE: "widersprüchlich",
+}
+# Wartezeit nach der letzten Änderung, bevor die Lösbarkeit neu analysiert wird
+ANALYSIS_DEBOUNCE_MS = 250
+
+
 def setup_theme():
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
@@ -27,57 +55,54 @@ def setup_theme():
 # =============================================================================
 # HAUPTFENSTER
 # =============================================================================
-# =============================================================================
-# HAUPTFENSTER
-# =============================================================================
 class MainWindowMixin:
-    """Shared implementation for both Standalone (CTk) and Hub-Tool (CTkToplevel)"""
-    
+    """Gemeinsame Implementierung für Standalone (CTk) und Hub-Tool (CTkToplevel)"""
+
     def _init_shared(self, is_standalone=True):
         self.is_standalone = is_standalone
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-
-
-class MainWindow(ctk.CTk, MainWindowMixin):
-    """Standalone Root Window"""
-    def __init__(self, is_standalone=True):
-        super().__init__()
-        self._init_shared(is_standalone=True)
-
-class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
-    """Child Window for Hub"""
-    def __init__(self):
-        super().__init__()
-        self._init_shared(is_standalone=False)
-        # Toplevel specifics
-        self.after(200, lambda: self.focus())
-
         setup_theme()
-        
+        for sequence, action in (("<Control-z>", "undo"), ("<Control-y>", "redo"), ("<Control-Z>", "redo")):
+            self.bind(sequence, lambda event, a=action: self._editor_history(a))
+
         self.title("✨ QR-Code Rekonstruktion ✨")
         self.geometry("1550x980")
         self.minsize(1200, 800)
         self.configure(fg_color=Colors.BG_PRIMARY)
-        
+
         # State
         self.matrix: Optional[QRMatrix] = None
         self.validator = QRValidator()
-        self.bruteforce_engine: Optional[BruteforceEngine] = None
+        # Laufender Job: Reconstructor oder (als Fallback) BruteforceEngine
+        self.active_job = None
         self.bruteforce_thread: Optional[threading.Thread] = None
         self.is_running = False
-        
+
         # UI Components
         self.grid_editor: Optional[GridEditor] = None
-        self.editor_controls: Optional[GridEditorControls] = None
+        self.editor_controls = None
         self.results_view: Optional[ResultsView] = None
         
+        # Foto aus dem Bild-Import (entzerrt, Graubild) als Editor-Hintergrund
+        self.photo = None
+        self.photo_on = True
+        
+        # Lösbarkeitsanalyse (läuft entprellt im Hintergrund)
+        self.overlay_on = False
+        self._analysis_after = None
+        self._analysis_generation = 0
+        self._analysis_queue: queue.Queue = queue.Queue()
+        self._analysis_polling = False
+        self._last_report = None
+        self._inspect_cache = (None, None)
+
         self._build_start_screen()
 
     def _on_close(self):
         """Clean exit handler"""
-        if self.is_running and self.bruteforce_engine:
-            self.bruteforce_engine.stop()
+        if self.is_running and self.active_job:
+            self.active_job.stop()
         
         # If standalone, we destroy ourselves (and exit app)
         if self.is_standalone:
@@ -89,49 +114,6 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             # Actually, launcher.py overwrites it AFTER launch_gui returns. 
             # So this method might be overwritten by launcher. But to be safe:
             self.withdraw() # Default to hide
-
-    # ... (Theme code skipped) ...
-
-    def _on_progress(self, tested, valid, total):
-        # FIX: Ensure main thread update
-        # Using separate thread for callbacks might be risky.
-        try:
-            # Check if window still exists
-            if not self.winfo_exists(): return 
-            
-            # Schedule update
-            self.after(10, lambda t=tested, v=valid, tot=total: self._update_progress_ui(t, v, tot))
-        except:
-            pass
-
-    def _update_progress_ui(self, tested, valid, total):
-        try:
-            self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")
-        except:
-            pass
-    
-    def _on_result(self, result):
-        try:
-            if not self.winfo_exists(): return
-            self.after(10, lambda r=result: self.results_view.add_result(r))
-        except:
-            pass
-    
-    def _on_complete(self, results):
-        self.is_running = False
-        try:
-            self.progress_bar.stop()
-            self.progress_bar.pack_forget()
-            self.btn_stop.configure(state="normal", text="✓ Fertig", command=self._back, fg_color=Colors.SUCCESS, text_color="#ffffff", hover_color="#2e8b57")
-            
-            stats = self.bruteforce_engine.get_stats()
-            # Only show messagebox if window is focused/active
-            messagebox.showinfo("Fertig", f"Tests: {stats['tested']:,}\nGültig: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s", parent=self)
-        except:
-            pass
-
-    # ... (Rest of code) ...
-    
 
     def _build_start_screen(self):
         """Start-Screen mit Versionsauswahl"""
@@ -250,6 +232,21 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             border_color=Colors.ACCENT
         ).pack(side="left", padx=10)
         
+        # Bild-Import
+        ctk.CTkLabel(version_section, text="- oder -", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(pady=10)
+        ctk.CTkButton(
+            version_section,
+            text="📷 Bild importieren (Foto / Screenshot)",
+            command=self._import_image,
+            width=320,
+            height=44,
+            font=Fonts.BUTTON_LARGE,
+            fg_color=Colors.ACCENT,
+            text_color="#ffffff",
+            hover_color=Colors.ACCENT_HOVER,
+            corner_radius=Dimensions.CORNER_RADIUS_M
+        ).pack(pady=(0, 10))
+        
         # Info
         ctk.CTkLabel(
             center,
@@ -305,7 +302,82 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
     def _create_matrix(self, size: int):
         """Erstellt Matrix"""
         self.matrix = QRMatrix(size=size)
+        self.photo = None
         self._build_editor_view()
+
+    # ------------------------------------------------------------------ Bild-Import
+    def _import_image(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="QR-Code-Bild öffnen",
+            filetypes=[("Bilder", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"), ("Alle Dateien", "*.*")])
+        if not path:
+            return
+        try:
+            image = image_import.load_image(path)
+            corners = image_import.detect_corners(image)
+        except image_import.ImageImportError as e:
+            messagebox.showerror("Bild-Import", str(e), parent=self)
+            return
+        CornerDialog(self, image, corners, on_accept=lambda c: self._run_import(image, c))
+
+    def _run_import(self, image, corners):
+        """Abtasten im Hintergrund (bei großen Versionen einige Sekunden), dann in den Editor"""
+        busy = ctk.CTkToplevel(self)
+        busy.title("Bild-Import")
+        busy.configure(fg_color=Colors.BG_PRIMARY)
+        busy.resizable(False, False)
+        ctk.CTkLabel(busy, text="Bild wird analysiert …", font=Fonts.BODY,
+                     text_color=Colors.TEXT_PRIMARY).pack(padx=40, pady=(20, 8))
+        bar = ctk.CTkProgressBar(busy, mode="indeterminate", width=260, progress_color=Colors.ACCENT)
+        bar.pack(padx=40, pady=(0, 20))
+        bar.start()
+        busy.transient(self)
+
+        results: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                results.put(image_import.sample_grid(image, corners))
+            except Exception as e:  # dem Nutzer melden statt den Thread still sterben zu lassen
+                logger.exception("Bild-Import fehlgeschlagen")
+                results.put(e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                outcome = results.get_nowait()
+            except queue.Empty:
+                self.after(50, poll)
+                return
+            busy.destroy()
+            if isinstance(outcome, Exception):
+                messagebox.showerror("Bild-Import", f"Das Bild konnte nicht ausgewertet werden:\n{outcome}",
+                                     parent=self)
+                return
+            self._apply_import(outcome)
+
+        self.after(50, poll)
+
+    def _apply_import(self, result):
+        if result.pattern_score < 0.85 and not messagebox.askyesno(
+                "Bild-Import",
+                f"Die festen Muster (Finder, Timing) passen nur zu {result.pattern_score:.0%} - "
+                "vermutlich sitzen die Ecken nicht richtig.\n\nTrotzdem übernehmen?", parent=self):
+            return
+        self.matrix = result.to_matrix()
+        self.photo = result.warped
+        self.photo_on = True
+        self._build_editor_view()
+        unsure = int(result.unsure.sum())
+        messagebox.showinfo(
+            "Bild-Import",
+            f"Version {self.matrix.version} ({result.size}×{result.size}) erkannt, "
+            f"feste Muster passen zu {result.pattern_score:.0%}.\n"
+            f"{unsure} unsichere Module wurden als unbekannt markiert.\n\n"
+            "Flecken, Knicke oder Reflexe erkennt das Tool nicht sicher: Markiere beschädigte "
+            "Stellen per Rechtsklick als unbekannt. Das Foto liegt dafür hinter dem Raster "
+            "(Schalter „Foto anzeigen“).", parent=self)
     
     def _build_editor_view(self):
         """Editor View mit neuem Sidebar-Layout"""
@@ -319,21 +391,30 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         canvas_container = ctk.CTkFrame(main, fg_color="#333333", corner_radius=Dimensions.CORNER_RADIUS_NONE)
         canvas_container.pack(fill="both", expand=True, side="left")
         
+        # Statuszeile für den Codewort-Inspektor
+        self.inspector_label = ctk.CTkLabel(
+            canvas_container, text="  Maus über ein Modul bewegen, um Codewort und Block zu sehen",
+            font=Fonts.SMALL, text_color="#cbd5e1", fg_color="#262626", anchor="w", height=26)
+        self.inspector_label.pack(side="bottom", fill="x")
+        
         self.grid_editor = GridEditor(canvas_container, self.matrix)
         self.grid_editor.pack(fill="both", expand=True)
+        self.grid_editor.on_hover = self._on_inspect
+        if self.photo is not None:
+            self.grid_editor.set_photo(self.photo, show=self.photo_on)
         
         def on_change(r, c):
             self._update_stats_sidebar()
         self.grid_editor.on_cell_changed = on_change
         
         # 2. Sidebar (Right) - Fixed width
-        sidebar = ctk.CTkFrame(main, fg_color=Colors.BG_CARD, width=320, corner_radius=Dimensions.CORNER_RADIUS_NONE)
+        # Scrollbar, damit bei kleinen Fenstern nichts abgeschnitten wird
+        sidebar = ctk.CTkScrollableFrame(main, fg_color=Colors.BG_CARD, width=310, corner_radius=Dimensions.CORNER_RADIUS_NONE)
         sidebar.pack(fill="y", side="right")
-        sidebar.pack_propagate(False) # Fixed width
         
         # Sidebar Content
         ctk.CTkLabel(sidebar, text="QR Rekonstruktion", font=Fonts.HEADING, text_color=Colors.TEXT_PRIMARY).pack(pady=(20, 5), padx=20, anchor="w")
-        ctk.CTkLabel(sidebar, text=f"Version {self.matrix.size}x{self.matrix.size}", font=Fonts.BODY, text_color=Colors.TEXT_MUTED).pack(pady=(0, 20), padx=20, anchor="w")
+        ctk.CTkLabel(sidebar, text=f"Version {self.matrix.version} ({self.matrix.size}×{self.matrix.size})", font=Fonts.BODY, text_color=Colors.TEXT_MUTED).pack(pady=(0, 20), padx=20, anchor="w")
         
         # Stats Panel
         self.stats_labels = {}
@@ -368,7 +449,7 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         stats_frame = ctk.CTkFrame(parent, fg_color="transparent")
         stats_frame.pack(fill="x", padx=20)
         
-        items = ["Unbekannt", "Kombinationen", "Zeit"]
+        items = ["Unbekannte Pixel", "Format", "Lösbarkeit"]
         for item in items:
             row = ctk.CTkFrame(stats_frame, fg_color="transparent")
             row.pack(fill="x", pady=2)
@@ -376,6 +457,54 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             lbl = ctk.CTkLabel(row, text="-", font=Fonts.BODY_BOLD, text_color=Colors.TEXT_PRIMARY)
             lbl.pack(side="right")
             self.stats_labels[item] = lbl
+        
+        self.analysis_message = ctk.CTkLabel(
+            stats_frame, text="", font=Fonts.SMALL, text_color=Colors.TEXT_SECONDARY,
+            wraplength=270, justify="left", anchor="w")
+        self.analysis_message.pack(fill="x", pady=(6, 0))
+        self.analysis_blocks = ctk.CTkLabel(
+            stats_frame, text="", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED,
+            wraplength=270, justify="left", anchor="w")
+        self.analysis_blocks.pack(fill="x", pady=(2, 0))
+        
+        # Foto-Schalter (nur nach Bild-Import)
+        if self.photo is not None:
+            photo_var = ctk.BooleanVar(value=self.photo_on)
+            
+            def toggle_photo():
+                self.photo_on = photo_var.get()
+                self.grid_editor.show_photo = self.photo_on
+                self.grid_editor.render()
+            
+            ctk.CTkSwitch(
+                stats_frame, text="Foto hinter dem Raster anzeigen", variable=photo_var,
+                command=toggle_photo, font=Fonts.SMALL, text_color=Colors.TEXT_PRIMARY,
+                progress_color=Colors.ACCENT,
+            ).pack(anchor="w", pady=(10, 0))
+        
+        # Overlay-Schalter + Legende
+        overlay_var = ctk.BooleanVar(value=self.overlay_on)
+        
+        def toggle_overlay():
+            self.overlay_on = overlay_var.get()
+            self.grid_editor.overlay_enabled = self.overlay_on
+            self.grid_editor.render()
+        
+        ctk.CTkSwitch(
+            stats_frame, text="Overlay: Blöcke & Format-Info", variable=overlay_var,
+            command=toggle_overlay, font=Fonts.SMALL, text_color=Colors.TEXT_PRIMARY,
+            progress_color=Colors.ACCENT,
+        ).pack(anchor="w", pady=(10, 2))
+        legend = ctk.CTkFrame(stats_frame, fg_color="transparent")
+        legend.pack(fill="x")
+        entries = [(Colors.OVERLAY_OK, "eindeutig"), (Colors.OVERLAY_CORRECTED, "korrigiert"),
+                   (Colors.OVERLAY_AMBIGUOUS, "mehrdeutig"), (Colors.OVERLAY_UNSOLVABLE, "widersprüchlich"),
+                   (Colors.OVERLAY_FORMAT, "Format-Info")]
+        for i, (color, text) in enumerate(entries):
+            item = ctk.CTkFrame(legend, fg_color="transparent")
+            item.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 8))
+            ctk.CTkLabel(item, text="■", font=Fonts.SMALL, text_color=color, width=10).pack(side="left")
+            ctk.CTkLabel(item, text=text, font=("Segoe UI", 9), text_color=Colors.TEXT_MUTED).pack(side="left")
 
     def _build_sidebar_controls(self, parent):
         ctk.CTkLabel(parent, text="Werkzeuge", font=Fonts.SUBHEADING, text_color=Colors.TEXT_PRIMARY).pack(padx=20, anchor="w", pady=(0, 10))
@@ -385,30 +514,31 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         btn_grid.pack(fill="x", padx=15)
         
         def reset():
+            # Alles außer den festen Mustern wird unbekannt, Farben werden verworfen
+            self.grid_editor.push_undo()
             self.matrix.reset()
-            self.grid_editor._init_cells_white()
             self.grid_editor.render()
             self._update_stats_sidebar()
             
-        def all_white():
-            import numpy as np
+        def unknown_to_white():
+            # Nützlich nach dem Abmalen nur der schwarzen Pixel: Rest als bekannt-weiß übernehmen
             from ..core.qr_matrix import CellState
-            # Set unlocked to white
+            self.grid_editor.push_undo()
             mask = ~self.matrix.locked
             self.matrix.grid[mask] = CellState.WHITE
+            self.matrix.locked[mask] = True
             self.grid_editor.render()
             self._update_stats_sidebar()
             
-        def unlock_all():
-            # Unlock un-fixed
-            for r in range(self.matrix.size):
-                for c in range(self.matrix.size):
-                    if not self.matrix._is_fixed_pattern(r, c):
-                        self.matrix.locked[r, c] = False
+        def all_unknown():
+            # Farben bleiben erhalten, alle nicht festen Pixel gelten als unbekannt
+            self.grid_editor.push_undo()
+            self.matrix.locked[~self.matrix.fixed] = False
             self.grid_editor.render()
             self._update_stats_sidebar()
             
-        btns = [("Reset", reset), ("Alles Weiß", all_white), ("Unlock All", unlock_all)]
+        btns = [("Reset (alles leeren)", reset), ("Unbekannte → Weiß", unknown_to_white),
+                ("Alles als unbekannt markieren", all_unknown)]
         for txt, cmd in btns:
             ctk.CTkButton(
                 btn_grid, text=txt, command=cmd,
@@ -419,7 +549,8 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         
         # Hints
         ctk.CTkLabel(parent, text="Steuerung:", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(padx=20, anchor="w", pady=(20, 5))
-        hints = ["Linksklick: Malen", "Rechtsklick: Sperren", "Scroll: Zoom", "Ctrl+Klick: Bewegen"]
+        hints = ["Linksklick: Schwarz/Weiß malen (= bekannt)", "Rechtsklick: unbekannt markieren / zurück",
+                 "Scroll: Zoom", "Strg+Klick oder Mittelklick: Bewegen", "Strg+Z / Strg+Y: Rückgängig / Wiederholen"]
         for h in hints:
              ctk.CTkLabel(parent, text=f"• {h}", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED).pack(padx=25, anchor="w")
 
@@ -442,7 +573,7 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         self.mode_menu.pack(padx=20, fill="x")
         
         # Descriptions
-        self.mode_desc = ctk.CTkLabel(parent, text="Schnelltest (1k Versuche, 30s)", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED, wraplength=280, justify="left")
+        self.mode_desc = ctk.CTkLabel(parent, text="Reed-Solomon-Rekonstruktion (max. 30s).\nFallback-Bruteforce: max. 1.000 Versuche.", font=Fonts.SMALL, text_color=Colors.TEXT_MUTED, wraplength=280, justify="left")
         self.mode_desc.pack(padx=20, pady=(5,0), anchor="w")
         
         # Custom Inputs Container (Hidden by default)
@@ -467,6 +598,17 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         ctk.CTkLabel(self.custom_inputs, text="* Stoppt wenn eines erreicht wird", font=("Segoe UI", 10), text_color=Colors.TEXT_MUTED).pack(anchor="w", pady=(2,0))
 
         
+        # Bekannter Textanfang: hilft bei mehrdeutigem Schaden (Struktur-Solver)
+        ctk.CTkLabel(parent, text="Bekannter Textanfang (optional)", font=Fonts.SMALL,
+                     text_color=Colors.TEXT_PRIMARY).pack(padx=20, anchor="w", pady=(12, 2))
+        self.prefix_entry = ctk.CTkEntry(parent, height=28, font=Fonts.BODY,
+                                         placeholder_text="z.B. https://")
+        self.prefix_entry.pack(padx=20, fill="x")
+        if getattr(self, 'known_prefix', ''):
+            self.prefix_entry.insert(0, self.known_prefix)
+        ctk.CTkLabel(parent, text="Hilft, wenn der Code zu stark beschädigt ist.", font=("Segoe UI", 10),
+                     text_color=Colors.TEXT_MUTED).pack(padx=20, anchor="w")
+
         self.btn_start = ctk.CTkButton(
             parent,
             text="✨ Wiederherstellen",
@@ -481,10 +623,10 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         
     def _on_mode_change_sidebar(self, choice):
         if choice == "fast":
-            self.mode_desc.configure(text="Schnelltest für kleine Fehler.\nMax 1.000 Versuche oder 30s.")
+            self.mode_desc.configure(text="Reed-Solomon-Rekonstruktion (max. 30s).\nFallback-Bruteforce: max. 1.000 Versuche.")
             self.custom_inputs.pack_forget()
         elif choice == "accurate":
-            self.mode_desc.configure(text="Tiefensuche für bis zu ~15 fehlende Pixel.\nMax 50.000 Versuche oder 120s.")
+            self.mode_desc.configure(text="Reed-Solomon-Rekonstruktion (max. 120s).\nFallback-Bruteforce: max. 50.000 Versuche.")
             self.custom_inputs.pack_forget()
         elif choice == "custom":
             self.mode_desc.configure(text="Benutzerdefinierte Limits.\nLeerlassen = Keine Grenze.")
@@ -492,94 +634,162 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
 
 
     def _update_stats_sidebar(self):
-        if not hasattr(self, 'stats_labels'): return
-        
-        import numpy as np
-        total = self.matrix.size * self.matrix.size
-        locked = int(np.sum(self.matrix.locked))
-        unknown = total - locked
-        
-        self.stats_labels["Unbekannt"].configure(text=str(unknown))
-        
-        if unknown <= 63:
-            combos = f"2^{unknown}" if unknown > 20 else f"{2**unknown:,}"
-        else:
-            combos = f"2^{unknown}"
-        self.stats_labels["Kombinationen"].configure(text=combos)
-        
-        # Est Time
-        if unknown > 25:
-             t = "∞"
-        elif unknown == 0:
-             t = "0s"
-        else:
-             # Rough est
-             tests = 2**unknown
-             secs = tests / 2000 # Assume 2k/sec
-             if secs < 60: t = f"{secs:.1f}s"
-             elif secs < 3600: t = f"{secs/60:.1f}m"
-             else: t = f"{secs/3600:.1f}h"
-             
-        self.stats_labels["Zeit"].configure(text=t)
+        if not hasattr(self, 'stats_labels') or not self.stats_labels:
+            return
+        unknown = int((~self.matrix.locked).sum())
+        self.stats_labels["Unbekannte Pixel"].configure(text=str(unknown))
+        self._schedule_analysis()
 
-    # _build_config and _build_action_bar are replaced by sidebar methods
-    # We remove them implicitly by overwriting _build_editor_view which called them.
-    # But we need to make sure _start_bruteforce still works (it uses self.iter_entry which is gone).
-    # We simplified mode selection to just Dropdown.
-    # We need to update _start_bruteforce to not crash on missing widgets.
+    def _schedule_analysis(self):
+        """Analyse erst nach einer kurzen Pause starten, nicht bei jedem gemalten Pixel"""
+        if self._analysis_after is not None:
+            self.after_cancel(self._analysis_after)
+        self.stats_labels["Lösbarkeit"].configure(text="…", text_color=Colors.TEXT_MUTED)
+        self._analysis_after = self.after(ANALYSIS_DEBOUNCE_MS, self._start_analysis)
 
-    
-    def _build_action_bar(self, parent):
-        """Action Bar"""
-        bar = ctk.CTkFrame(parent, fg_color=Colors.BG_SECONDARY, height=70, corner_radius=Dimensions.CORNER_RADIUS_NONE)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
+    def _start_analysis(self):
+        self._analysis_after = None
+        self._analysis_generation += 1
+        generation = self._analysis_generation
+        snapshot = self.matrix.clone()  # der Thread arbeitet nie auf der Matrix, die gerade bemalt wird
+        results = self._analysis_queue
+
+        def work():
+            try:
+                report = analyze_solvability(snapshot)
+            except Exception:
+                logger.exception("Lösbarkeitsanalyse fehlgeschlagen")
+                report = None
+            results.put((generation, report))
+
+        threading.Thread(target=work, daemon=True).start()
+        if not self._analysis_polling:
+            self._analysis_polling = True
+            self.after(30, self._poll_analysis)
+
+    def _poll_analysis(self):
+        """Einzige Poll-Schleife: wartet auf das Ergebnis der neuesten Analyse, ältere werden verworfen"""
+        found, current = False, None
+        try:
+            while True:
+                generation, report = self._analysis_queue.get_nowait()
+                if generation == self._analysis_generation:
+                    found, current = True, report
+                    break
+        except queue.Empty:
+            pass
+        if not found and self.winfo_exists():
+            self.after(30, self._poll_analysis)
+            return
+        self._analysis_polling = False
+        self._show_analysis(current)
+
+    def _editor_history(self, action: str):
+        """Strg+Z / Strg+Y - nur im Editor"""
+        editor = self.grid_editor
+        if editor is None or not editor.winfo_exists() or self.is_running:
+            return
+        getattr(editor, action)()
+
+    def _on_inspect(self, cell):
+        """Codewort-Inspektor: erklärt das Modul unter der Maus"""
+        if cell is None or not getattr(self, 'inspector_label', None) or not self.inspector_label.winfo_exists():
+            return
+        self.inspector_label.configure(text="  " + self._describe_module(*cell))
+
+    def _describe_module(self, r: int, c: int) -> str:
+        m = self.matrix
+        assert m is not None  # der Inspektor existiert nur im Editor
+        known = "bekannt" if m.locked[r, c] else "unbekannt"
+        where = f"Zeile {r + 1}, Spalte {c + 1}"
+        for copy, positions in enumerate(format_info_positions(m.size), start=1):
+            if (r, c) in positions:
+                return f"{where} · Format-Info, Bit {positions.index((r, c))} (Kopie {copy}) · {known}"
+        if m.fixed[r, c]:
+            if m.version >= 7 and any((r, c) in block for block in version_info_positions(m.size)):
+                kind = "Version-Info"
+            elif (r, c) == (4 * m.version + 9, 8):
+                kind = "Dark Module"
+            elif (r <= 7 and c <= 7) or (r <= 7 and c >= m.size - 8) or (r >= m.size - 8 and c <= 7):
+                kind = "Finder-Pattern / Separator"
+            elif r == 6 or c == 6:
+                kind = "Timing-Pattern"
+            else:
+                kind = "Alignment-Pattern"
+            return f"{where} · {kind} (fest, aus der Version)"
+        report = self._last_report
+        if report is None or report.module_codeword is None:
+            return f"{where} · {known}"
+        if report.module_codeword[r, c] < 0:
+            return f"{where} · Restbit (gehört zu keinem Codewort) · {known}"
+        index = int(report.module_codeword[r, c])
+        block, pos, is_ec = report.codeword_location[index]
+        text = (f"{where} · Codewort {index + 1} · Block {block + 1}, Byte {pos + 1} "
+                f"({'Fehlerkorrektur' if is_ec else 'Daten'}) · Bit {report.module_bit[r, c]} · {known}")
+        # Wert des Codeworts (entmaskiert), wenn alle 8 Bits bekannt sind
+        if self._inspect_cache[0] is not report:
+            reading = read_codewords((m.grid == 1).astype('uint8'), m.locked, m.version, report.format.mask)
+            self._inspect_cache = (report, reading)
+        reading = self._inspect_cache[1]
+        if reading.known_masks[index] == 0xFF:
+            # Nur hex: Zeichen sind gegenüber den Codewörtern um den Modus-Indikator (4 Bit) verschoben
+            text += f" · Wert 0x{reading.values[index]:02X}"
+        return text
+
+    def _show_analysis(self, report):
+        labels = getattr(self, 'stats_labels', None)
+        if not labels or not labels["Lösbarkeit"].winfo_exists():
+            return  # Editor wurde inzwischen verlassen
+        if report is None:
+            labels["Lösbarkeit"].configure(text="Fehler", text_color=Colors.ERROR)
+            return
         
-        # Top border shadow
-        ctk.CTkFrame(bar, fg_color=Colors.BORDER, height=1).pack(fill="x", side="top")
+        self._last_report = report
+        self._inspect_cache = (None, None)
+        text, color = VERDICT_DISPLAY[report.verdict]
+        labels["Lösbarkeit"].configure(text=text, text_color=color)
+        fmt = report.format
+        fmt_text = f"{fmt.ec_level} / Maske {fmt.mask}"
+        if fmt.known_bits == 0:
+            fmt_text += " (geraten)"
+        elif fmt.mismatches:
+            fmt_text += f" ({fmt.mismatches} Bit abweichend)"
+        labels["Format"].configure(text=fmt_text)
+        message = report.message
+        if report.verdict == VERDICT_AMBIGUOUS:
+            message += (" Tipp: Den bekannten Textanfang eintragen (z.B. https://) - die Rekonstruktion "
+                        "nutzt zusätzlich den Aufbau der Daten (Länge, Füllbytes).")
+        self.analysis_message.configure(text=message)
         
-        # Start Button
-        self.btn_start = ctk.CTkButton(
-            bar,
-            text="✨ Rekonstruktion starten",
-            command=self._start_bruteforce,
-            width=240,
-            height=40,
-            font=Fonts.BUTTON_LARGE,
-            fg_color=Colors.ACCENT,
-            text_color="#ffffff",
-            hover_color=Colors.ACCENT_HOVER,
-            corner_radius=Dimensions.CORNER_RADIUS_L
-        )
-        self.btn_start.pack(side="right", padx=20, pady=15)
+        # Blöcke: bei wenigen einzeln auflisten, sonst zusammenfassen
+        if len(report.blocks) <= 4:
+            lines = [f"Block {b.index + 1}: {b.unknown_codewords}/{b.nsym} Codewörter unbekannt "
+                     f"– {BLOCK_STATUS_NAMES[b.status]}" for b in report.blocks]
+        else:
+            counts = {}
+            for b in report.blocks:
+                counts[b.status] = counts.get(b.status, 0) + 1
+            lines = [f"{len(report.blocks)} Blöcke: " + ", ".join(
+                f"{n} {BLOCK_STATUS_NAMES[status]}" for status, n in counts.items())]
+        lines.append("(unbekannte Codewörter / EC-Codewörter je Block)")
+        self.analysis_blocks.configure(text="\n".join(lines))
         
-        # Quick Stats
-        self.quick_stats = ctk.CTkLabel(bar, text="", font=Fonts.BODY, text_color=Colors.TEXT_PRIMARY)
-        self.quick_stats.pack(side="left", padx=30, pady=15)
-        self._update_quick_stats()
-    
-    def _update_quick_stats(self):
-        if self.matrix and hasattr(self, 'quick_stats'):
-            stats = self.matrix.get_stats()
-            self.quick_stats.configure(text=f"📊 Version {stats['version']}  •  {stats['unknown_cells']} Unbekannte Zellen")
-            
+        if self.grid_editor is not None and self.grid_editor.winfo_exists():
+            self.grid_editor.set_overlay(report, enabled=self.overlay_on)
+
     def _start_bruteforce(self):
-        """Bruteforce starten"""
+        """Rekonstruktion starten: erst Reed-Solomon, Pixel-Bruteforce nur als Fallback"""
         stats = self.matrix.get_stats()
         unknown = stats['unknown_cells']
         
         if unknown == 0:
             messagebox.showinfo("Info", "Alle Pixel sind bereits bekannt!", parent=self)
             return
-            
-        if unknown > 30:
-            if not messagebox.askyesno("Warnung", f"{unknown} unbekannte Pixel = Extrem viele Kombinationen!\nFortfahren?", parent=self):
-                return
         
         if hasattr(self, 'btn_start'):
             self.btn_start.configure(state="disabled", text="⏳ Arbeite...")
-            
-        self._build_results_view()
+        # Alle Eingaben des Editors lesen, bevor die Ergebnisansicht ihn ersetzt
+        self.known_prefix = self.prefix_entry.get().strip() if hasattr(self, 'prefix_entry') else ''
         
         mode = self.mode_var.get()
         max_iter = None
@@ -610,60 +820,79 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             max_iter = 50000
             max_time = 120
         
+        self._run_settings = (mode, max_iter, max_time)
+        self._build_results_view()
         self.is_running = True
-        self.bruteforce_engine = BruteforceEngine(self.matrix, self.validator)
-        
-        # --- THREAD SAFETY FIX ---
-        import queue
-        self.msg_queue = queue.Queue()
-        
-        def on_progress(p, v, m): # Args: tested, valid, max
-            self.msg_queue.put(("progress", (p, v, m)))
-            
-        def on_result(r):
-            self.msg_queue.put(("result", r))
-            
-        self.bruteforce_engine.set_progress_callback(on_progress)
-        self.bruteforce_engine.set_result_callback(on_result)
-        
+        job = Reconstructor(self.matrix, self.validator, known_prefix=self.known_prefix)
+        self._start_job(job, lambda: job.run(max_time=max_time), "rs_complete")
+
+    def _start_job(self, job, run_job, complete_message):
+        """Startet einen Job (Reconstructor/BruteforceEngine) in einem Hintergrund-Thread"""
+        self.active_job = job
+
+        # Worker-Thread kommuniziert nur über seine eigene Queue mit der UI.
+        # Lokale Variable statt self.msg_queue, damit ein alter Lauf nie in die Queue eines neuen schreibt.
+        msg_queue = queue.Queue()
+        self.msg_queue = msg_queue
+
+        job.set_progress_callback(lambda tested, valid, total: msg_queue.put(("progress", (tested, valid, total))))
+        job.set_result_callback(lambda result: msg_queue.put(("result", result)))
+
         def run():
-            results = self.bruteforce_engine.run(mode=mode, max_iterations=max_iter, max_time=max_time, parallel=True)
-            self.msg_queue.put(("complete", results))
-        
+            msg_queue.put((complete_message, run_job()))
+
         self.bruteforce_thread = threading.Thread(target=run, daemon=True)
         self.bruteforce_thread.start()
-        
-        # Start Polling
-        self._check_queue()
 
-    def _check_queue(self):
-        """Polls the queue for messages from the worker thread"""
-        if not self.winfo_exists():
+        self._check_queue(msg_queue)
+
+    def _start_fallback_bruteforce(self):
+        """Pixel-Bruteforce, wenn die RS-Rekonstruktion keine Lösung gefunden hat"""
+        mode, max_iter, max_time = self._run_settings
+        unknown = self.matrix.get_stats()['unknown_cells']
+        question = ("Die Reed-Solomon-Rekonstruktion hat keine Lösung gefunden.\n"
+                    f"Pixel-Bruteforce über {unknown} unbekannte Pixel versuchen?")
+        if unknown > 30:
+            question += f"\n\nAchtung: 2^{unknown} Kombinationen - nur eine Stichprobe ist machbar."
+        if not messagebox.askyesno("Keine Lösung", question, parent=self):
+            self._on_complete([])
             return
-            
+        engine = BruteforceEngine(self.matrix, self.validator)
+        self._start_job(
+            engine,
+            lambda: engine.run(mode=mode, max_iterations=max_iter, max_time=max_time, parallel=True),
+            "complete",
+        )
+
+    def _check_queue(self, msg_queue):
+        """Pollt die Queue des Worker-Threads (läuft im Tk-Main-Thread)"""
+        # Ein Lauf, der per "Zurück" verlassen oder durch einen neuen ersetzt wurde, pollt nicht weiter
+        if not self.winfo_exists() or not self.is_running or msg_queue is not self.msg_queue:
+            return
+
         try:
-            import queue
             while True:
-                msg = self.msg_queue.get_nowait()
-                m_type, data = msg
-                
+                m_type, data = msg_queue.get_nowait()
+
                 if m_type == "progress":
-                    # data is (tested, valid, max)
-                    # We can update the UI here if we have a progress callback target
-                    # But the previous implementation called self._on_progress
-                    # Let's adapt it.
-                    pass 
+                    self._update_progress_ui(*data)
                 elif m_type == "result":
-                    self._on_result(data)
+                    self.results_view.add_result(data)
+                elif m_type == "rs_complete":
+                    # Fallback nur, wenn RS nichts fand und der Nutzer nicht abgebrochen hat
+                    if data or self.active_job.stop_requested:
+                        self._on_complete(data)
+                    else:
+                        self._start_fallback_bruteforce()
+                    return # Stop polling
                 elif m_type == "complete":
                     self._on_complete(data)
                     return # Stop polling
-                    
+
         except queue.Empty:
             pass
-            
-        if self.is_running:
-            self.after(50, self._check_queue)
+
+        self.after(50, self._check_queue, msg_queue)
 
 
     def _build_results_view(self):
@@ -681,7 +910,8 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         # Shadow line
         ctk.CTkFrame(main, fg_color="#d1d5db", height=1).pack(fill="x")
         
-        ctk.CTkLabel(header, text="✨ Rekonstruktion läuft...", font=Fonts.HEADING, text_color=Colors.TEXT_PRIMARY).pack(side="left", padx=20, pady=10)
+        self.header_title = ctk.CTkLabel(header, text="✨ Rekonstruktion läuft...", font=Fonts.HEADING, text_color=Colors.TEXT_PRIMARY)
+        self.header_title.pack(side="left", padx=20, pady=10)
         
         self.progress_label = ctk.CTkLabel(header, text="0 / 0", font=Fonts.BODY, text_color=Colors.TEXT_PRIMARY)
         self.progress_label.pack(side="left", padx=20)
@@ -701,9 +931,7 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
         self.progress_bar.pack(fill="x")
         self.progress_bar.start()
         
-        self.results_view = ResultsView(main)
-        self.results_view.pack(fill="both", expand=True, padx=20, pady=20)
-        
+        # Untere Leiste zuerst packen, damit sie nie von der (wachsenden) Ergebnisansicht verdrängt wird
         bottom = ctk.CTkFrame(main, fg_color=Colors.BG_SECONDARY, height=60, corner_radius=Dimensions.CORNER_RADIUS_NONE)
         bottom.pack(fill="x", side="bottom")
         ctk.CTkFrame(bottom, fg_color="#d1d5db", height=1).pack(fill="x", side="top")
@@ -716,40 +944,31 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             hover_color=Colors.BG_CARD_HOVER,
             corner_radius=Dimensions.CORNER_RADIUS_M
         ).pack(side="left", padx=20, pady=12)
+        
+        self.results_view = ResultsView(main)
+        self.results_view.pack(fill="both", expand=True, padx=20, pady=20)
     
-    def _on_progress(self, tested, valid, total):
-        # FIX: Ensure main thread update
-        try:
-            if not self.winfo_exists(): return 
-            self.after(10, lambda t=tested, v=valid, tot=total: self._update_progress_ui(t, v, tot))
-        except:
-            pass
-
     def _update_progress_ui(self, tested, valid, total):
-        try:
-            self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")
-        except:
-            pass
-    
-    def _on_result(self, result):
-        try:
-            if not self.winfo_exists(): return
-            self.after(10, lambda r=result: self.results_view.add_result(r))
-        except:
-            pass
-    
+        self.progress_label.configure(text=f"{tested:,} / {total:,} ({valid} gültig)")
+
     def _on_complete(self, results):
         self.is_running = False
+        self.header_title.configure(text="✨ Rekonstruktion abgeschlossen" if results else "Keine Lösung gefunden")
         self.progress_bar.stop()
         self.progress_bar.pack_forget()
         self.btn_stop.configure(state="normal", text="✓ Fertig", command=self._back, fg_color=Colors.SUCCESS, text_color="#ffffff", hover_color="#2e8b57")
         
-        stats = self.bruteforce_engine.get_stats()
-        messagebox.showinfo("Fertig", f"Tests: {stats['tested']:,}\nGültig: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s", parent=self)
+        stats = self.active_job.get_stats()
+        if stats.get('mode') == 'rs':
+            text = (f"Reed-Solomon-Rekonstruktion\nGeprüfte Formate: {stats['tested']}\n"
+                    f"Lösungen: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s")
+        else:
+            text = f"Tests: {stats['tested']:,}\nGültig: {stats['valid']}\nZeit: {stats.get('elapsed', 0):.1f}s"
+        messagebox.showinfo("Fertig", text, parent=self)
     
     def _stop(self):
-        if self.bruteforce_engine:
-            self.bruteforce_engine.stop()
+        if self.active_job:
+            self.active_job.stop()
         self.btn_stop.configure(state="disabled", text="Gestoppt")
     
     def _back(self):
@@ -757,7 +976,23 @@ class MainWindowToplevel(ctk.CTkToplevel, MainWindowMixin):
             if not messagebox.askyesno("Abbrechen?", "Noch am Laufen. Wirklich abbrechen?", parent=self):
                 return
             self._stop()
+            self.is_running = False
         self._build_editor_view()
+
+
+class MainWindow(MainWindowMixin, ctk.CTk):
+    """Standalone-Hauptfenster"""
+    def __init__(self, is_standalone=True):
+        super().__init__()
+        self._init_shared(is_standalone=is_standalone)
+
+
+class MainWindowToplevel(MainWindowMixin, ctk.CTkToplevel):
+    """Kindfenster für den Hub"""
+    def __init__(self):
+        super().__init__()
+        self._init_shared(is_standalone=False)
+        self.after(200, lambda: self.focus())
 
 
 def run_app():

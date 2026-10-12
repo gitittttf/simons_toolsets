@@ -5,6 +5,8 @@ test_output/
 .vscode/
 .idea/
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .github\instructions\snyk_rules.instructions.md
